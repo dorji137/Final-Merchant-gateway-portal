@@ -3,6 +3,7 @@ const { URL } = require('url');
 const fs = require('fs').promises;
 const path = require('path');
 const os = require('os');
+const PDFDocument = require('pdfkit');
 
 const MERCHANT_ID_DEFAULT = process.env.MERCHANT_ID || '863990030700270';
 const CARDZONE_MKREQ_URL = process.env.CARDZONE_MKREQ_URL || 'https://3dsecure.bob.bt/3dss/mkReq';
@@ -12,19 +13,13 @@ const CARDZONE_REDIRECT_URL =
   'https://3dsecure.bob.bt/3dss/mercReq';
 const CARDZONE_INQUIRY_URL =
   process.env.CARDZONE_INQUIRY_URL ||
-  process.env.CARDZONE_MERCREQ_URL ||
-  CARDZONE_REDIRECT_URL;
-const CARDZONE_REFUND_URL =
-  process.env.CARDZONE_REFUND_URL ||
-  process.env.CARDZONE_MERCREQ_URL ||
-  CARDZONE_INQUIRY_URL;
+  '';
 const CARDZONE_PROFILE_URL = process.env.CARDZONE_PROFILE_URL || '';
 const MERCHANT_CURRENCY_DB_PATH =
   process.env.MERCHANT_CURRENCY_DB_PATH || path.join(process.cwd(), 'data', 'merchant-currency.json');
 const ENABLE_MKREQ_MAC = process.env.ENABLE_MKREQ_MAC === 'true';
 const TEMP_DIR = process.env.VERCEL ? '/tmp' : path.join(os.tmpdir(), 'cardzone-backend');
 const PAYMENT_LINK_TTL_MS = Number(process.env.PAYMENT_LINK_TTL_MS || 7 * 24 * 60 * 60 * 1000);
-const REFUND_DEFAULT_CURRENCY = process.env.REFUND_DEFAULT_CURRENCY || '840';
 
 const txStore = new Map();
 
@@ -578,7 +573,10 @@ function buildFinalResultRecord({ fields, source, resolvedAt }) {
 
 function mapFinalPaymentStatus(finalResult) {
   if (!hasSufficientFinalResult(finalResult)) return 'PENDING';
-  if (finalResult.responseCode === '000' && finalResult.authorizationCode) return 'SUCCESS';
+  const rc = String(finalResult.responseCode || '').trim().toUpperCase();
+  if (rc === '00' || rc === '000' || rc === '0' || rc === '00_NR' || rc === '00_NRR' || /^0+$/.test(rc)) {
+    return 'SUCCESS';
+  }
   return 'FAILED';
 }
 
@@ -635,63 +633,6 @@ async function getPaymentLink(token) {
   } catch {
     return null;
   }
-}
-
-function matchesTxnReference(tx, referenceId) {
-  const ref = String(referenceId || '').trim();
-  if (!ref || !tx || typeof tx !== 'object') return false;
-
-  const callbackFields = tx.callback?.fields || {};
-  const candidates = [
-    tx.txnId,
-    callbackFields.MPI_TRXN_ID,
-    callbackFields.MPI_ORI_TRXN_ID,
-    callbackFields.trxnId,
-    callbackFields.txnId,
-  ].map(v => String(v || '').trim()).filter(Boolean);
-
-  return candidates.includes(ref);
-}
-
-async function findStoredTransactionForRefund(merchantId, originalTxnId) {
-  const mid = String(merchantId || '').trim();
-  const ref = String(originalTxnId || '').trim();
-  if (!mid || !ref) return null;
-
-  const direct = await getTransaction(ref);
-  if (direct && String(direct.merchantId || '').trim() === mid) {
-    return direct;
-  }
-
-  for (const tx of txStore.values()) {
-    if (String(tx?.merchantId || '').trim() !== mid) continue;
-    if (matchesTxnReference(tx, ref)) return tx;
-  }
-
-  try {
-    const files = await fs.readdir(TEMP_DIR);
-    const txFiles = files.filter(name => /^txn_.+\.json$/i.test(name));
-
-    for (const fileName of txFiles) {
-      try {
-        const content = await fs.readFile(path.join(TEMP_DIR, fileName), 'utf8');
-        const tx = JSON.parse(content);
-        if (String(tx?.merchantId || '').trim() !== mid) continue;
-        if (!matchesTxnReference(tx, ref)) continue;
-
-        if (tx?.txnId) {
-          txStore.set(String(tx.txnId), tx);
-        }
-        return tx;
-      } catch {
-        // ignore unreadable transaction files
-      }
-    }
-  } catch {
-    // ignore temp directory read errors
-  }
-
-  return null;
 }
 
 function generatePaymentLinkToken() {
@@ -755,6 +696,10 @@ function parseCardzoneResponseBody(rawText, contentType = '') {
 }
 
 async function doInquiry(tx, originalTxnId) {
+  if (!CARDZONE_INQUIRY_URL) {
+    throw new Error('Inquiry URL not configured. Set CARDZONE_INQUIRY_URL env var to enable inquiry fallback.');
+  }
+
   const requestFields = {
     MPI_TRANS_TYPE: 'INQ',
     MPI_MERC_ID: tx.merchantId,
@@ -810,273 +755,6 @@ async function doInquiry(tx, originalTxnId) {
   };
 }
 
-function isApprovedResponseCode(responseCode) {
-  const code = String(responseCode || '').trim().toUpperCase();
-  return code === '000' || code === '00' || code === '0';
-}
-
-function pickField(fields, candidates = []) {
-  if (!fields || typeof fields !== 'object') return '';
-
-  const candidateList = candidates.map(item => String(item || '').trim()).filter(Boolean);
-  const lowerCandidates = new Set(candidateList.map(item => item.toLowerCase()));
-
-  for (const field of candidateList) {
-    const value = String(fields?.[field] || '').trim();
-    if (value) return value;
-  }
-
-  for (const [key, value] of Object.entries(fields)) {
-    if (lowerCandidates.has(String(key || '').toLowerCase())) {
-      const text = String(value || '').trim();
-      if (text) return text;
-    }
-  }
-
-  const stack = [fields];
-  const visited = new Set();
-  while (stack.length) {
-    const node = stack.pop();
-    if (!node || typeof node !== 'object' || visited.has(node)) continue;
-    visited.add(node);
-
-    if (Array.isArray(node)) {
-      for (const item of node) {
-        if (item && typeof item === 'object') stack.push(item);
-      }
-      continue;
-    }
-
-    for (const [key, value] of Object.entries(node)) {
-      if (lowerCandidates.has(String(key || '').toLowerCase())) {
-        const text = String(value || '').trim();
-        if (text) return text;
-      }
-      if (value && typeof value === 'object') {
-        stack.push(value);
-      }
-    }
-  }
-
-  return '';
-}
-
-function toMinorUnitsFromGatewayAmount(value) {
-  const text = String(value || '').trim();
-  if (!text) return 0;
-  if (!/^\d+$/.test(text)) return 0;
-  return Number.parseInt(text, 10);
-}
-
-function mapGatewayStatus(fields = {}) {
-  const responseCode = pickField(fields, ['MPI_ERROR_CODE', 'responseCode', 'errorCode']);
-  const approvalCode = pickField(fields, ['MPI_APPR_CODE', 'approvalCode']);
-  if (isApprovedResponseCode(responseCode) && approvalCode) return 'SUCCESS';
-  if (isApprovedResponseCode(responseCode)) return 'APPROVED';
-  if (responseCode) return 'FAILED';
-  return 'UNKNOWN';
-}
-
-function mapGatewayLookupPayload(fields = {}, fallbackTxnId = '') {
-  const responseCode = pickField(fields, ['MPI_ERROR_CODE', 'responseCode', 'errorCode']);
-  const fallbackReason = pickField(fields, ['MPI_ERROR_DESC', 'MPI_CARDHOLDER_INFO', 'responseReason', 'errorDescription', 'message']);
-  const responseReason = getResponseReasonFromCode(responseCode, fallbackReason);
-
-  return {
-    txnId: pickField(fields, ['MPI_ORI_TRXN_ID', 'MPI_TRXN_ID', 'txnId', 'trxnId', 'ORI_TRXN_ID']) || fallbackTxnId,
-    amount: pickField(fields, ['MPI_PURCH_AMT', 'MPI_TXN_AMT', 'purchAmt', 'txnAmt', 'amount']),
-    currency: pickField(fields, ['MPI_PURCH_CURR', 'MPI_TXN_CURR', 'purchCurr', 'txnCurr', 'currency']),
-    approvalCode: pickField(fields, ['MPI_APPR_CODE', 'approvalCode', 'apprCode']),
-    rrn: pickField(fields, ['MPI_RRN', 'rrn']),
-    responseCode,
-    responseReason,
-    status: mapGatewayStatus(fields),
-    maskedPan: pickField(fields, ['MPI_PAN', 'maskedPan']),
-  };
-}
-
-function hasRefundLookupDetails(summary = {}) {
-  return !!(
-    String(summary.amount || '').trim() ||
-    String(summary.currency || '').trim() ||
-    String(summary.approvalCode || '').trim() ||
-    String(summary.rrn || '').trim() ||
-    String(summary.responseCode || '').trim() ||
-    String(summary.responseReason || '').trim()
-  );
-}
-
-function mapStoredTransactionToRefundLookup(tx, originalTxnId) {
-  const callbackFields = tx?.callback?.fields || {};
-  const final = tx?.finalResult || extractFinalResultFields(callbackFields);
-  const responseCode = String(final?.responseCode || '').trim();
-  const responseReason = getResponseReasonFromCode(responseCode, String(final?.responseReason || '').trim());
-  const fallbackAmount = pickField(callbackFields, ['MPI_PURCH_AMT', 'MPI_TXN_AMT', 'amount']);
-  const fallbackCurrency = pickField(callbackFields, ['MPI_PURCH_CURR', 'MPI_TXN_CURR', 'currency']);
-  const fallbackTxnId = pickField(callbackFields, ['MPI_TRXN_ID', 'MPI_ORI_TRXN_ID', 'txnId', 'trxnId']);
-  const fallbackPan = pickField(callbackFields, ['MPI_PAN', 'maskedPan']);
-
-  return {
-    txnId: String(tx?.txnId || fallbackTxnId || originalTxnId || '').trim(),
-    amount: String(tx?.amountMinor || fallbackAmount || '').trim(),
-    currency: String(tx?.currency || fallbackCurrency || '').trim(),
-    approvalCode: String(final?.authorizationCode || '').trim(),
-    rrn: String(final?.referenceNumber || '').trim(),
-    responseCode,
-    responseReason,
-    status: String(tx?.status || '').trim() || mapGatewayStatus(callbackFields),
-    maskedPan: String(fallbackPan || '').trim(),
-    callbackRawFields: callbackFields,
-  };
-}
-
-async function createCardzoneSession(merchantId, purchaseId) {
-  const keys = createRsaKeyPair();
-  const mkReq = await doMkReq({
-    merchantId,
-    purchaseId,
-    merchantPublicKeyBase64Url: keys.publicKeyBase64Url,
-    merchantPrivateKeyPem: keys.privateKeyPem,
-  });
-
-  const mkReqRes = mkReq.responsePayload;
-  if (String(mkReqRes.errorCode || '').trim() !== '000' || !mkReqRes.pubKey) {
-    throw new Error('mkReq failed for Cardzone session initialization.');
-  }
-
-  return {
-    keys,
-    mkReq,
-    cardzonePublicKeyBase64Url: mkReqRes.pubKey,
-  };
-}
-
-async function postCardzoneNon3dsRequest({ endpoint, requestFields }) {
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'Accept': 'application/json, application/x-www-form-urlencoded, text/plain',
-    },
-    body: new URLSearchParams(requestFields).toString(),
-  });
-
-  const rawBody = await response.text();
-  const responseFields = parseCardzoneResponseBody(rawBody, response.headers.get('content-type') || '');
-
-  if (!response.ok) {
-    throw new Error(`Cardzone request failed. HTTP ${response.status}. Body: ${rawBody.slice(0, 500)}`);
-  }
-
-  return {
-    responseStatus: response.status,
-    responseContentType: response.headers.get('content-type') || '',
-    responseFields,
-    rawBody,
-  };
-}
-
-async function lookupTransactionForRefund({ merchantId, originalTxnId, terminalId }) {
-  const purchaseId = generateTxnId();
-  const session = await createCardzoneSession(merchantId, purchaseId);
-
-  const requestFields = {
-    MPI_TRANS_TYPE: 'INQ',
-    MPI_MERC_ID: merchantId,
-    MPI_ORI_TRXN_ID: originalTxnId,
-  };
-
-  if (terminalId) requestFields.MPI_TERMINAL_ID = terminalId;
-
-  const signInput = mpiReqSignString(requestFields);
-  requestFields.MPI_MAC = signSha256WithRsaBase64Url(signInput, session.keys.privateKeyPem);
-
-  const response = await postCardzoneNon3dsRequest({
-    endpoint: CARDZONE_INQUIRY_URL,
-    requestFields,
-  });
-
-  const hasMac = !!response.responseFields.MPI_MAC;
-  const verifyInput = hasMac ? mpiResVerifyString(response.responseFields) : '';
-  const macVerified =
-    hasMac && !!session.cardzonePublicKeyBase64Url
-      ? verifySha256WithRsaBase64Url(verifyInput, response.responseFields.MPI_MAC, session.cardzonePublicKeyBase64Url)
-      : false;
-
-  let summary = mapGatewayLookupPayload(response.responseFields, originalTxnId);
-  if (!hasRefundLookupDetails(summary)) {
-    const localTx = await findStoredTransactionForRefund(merchantId, originalTxnId);
-    if (localTx && String(localTx.merchantId || '').trim() === String(merchantId || '').trim()) {
-      summary = mapStoredTransactionToRefundLookup(localTx, originalTxnId);
-    }
-  }
-
-  return {
-    requestedAt: new Date().toISOString(),
-    endpoint: CARDZONE_INQUIRY_URL,
-    requestFields,
-    signInput,
-    responseStatus: response.responseStatus,
-    responseContentType: response.responseContentType,
-    responseFields: response.responseFields,
-    rawBody: response.rawBody,
-    macVerification: {
-      hasMac,
-      macVerified,
-      verifyInput,
-      verifyNote: hasMac
-        ? (macVerified ? 'Inquiry MPIRes MAC verified successfully' : 'Inquiry MPIRes MAC verification failed')
-        : 'No MPI_MAC received on inquiry response',
-    },
-    summary,
-  };
-}
-
-async function initiateRefundRequest({ merchantId, originalTxnId, refundAmountMinor }) {
-  const purchaseId = generateTxnId();
-  const session = await createCardzoneSession(merchantId, purchaseId);
-  const refundTxnId = generateTxnId();
-
-  const requestFields = {
-    MPI_TRANS_TYPE: 'REFUND',
-    MPI_MERC_ID: merchantId,
-    MPI_ORI_TRXN_ID: originalTxnId,
-    MPI_PURCH_CURR: REFUND_DEFAULT_CURRENCY,
-    MPI_PURCH_AMT: String(refundAmountMinor),
-    MPI_TRXN_ID: refundTxnId,
-    MPI_PURCH_DATE: formatPurchDate(new Date()),
-  };
-
-  const signInput = mpiReqSignString(requestFields);
-  requestFields.MPI_MAC = signSha256WithRsaBase64Url(signInput, session.keys.privateKeyPem);
-
-  const response = await postCardzoneNon3dsRequest({
-    endpoint: CARDZONE_REFUND_URL,
-    requestFields,
-  });
-
-  const responseCode = pickField(response.responseFields, ['MPI_ERROR_CODE', 'responseCode', 'errorCode']);
-  const fallbackReason = pickField(response.responseFields, ['MPI_ERROR_DESC', 'MPI_CARDHOLDER_INFO', 'responseReason']);
-
-  return {
-    requestedAt: new Date().toISOString(),
-    endpoint: CARDZONE_REFUND_URL,
-    requestFields,
-    signInput,
-    responseStatus: response.responseStatus,
-    responseContentType: response.responseContentType,
-    responseFields: response.responseFields,
-    rawBody: response.rawBody,
-    result: {
-      status: mapGatewayStatus(response.responseFields),
-      responseCode,
-      responseReason: getResponseReasonFromCode(responseCode, fallbackReason),
-      approvalCode: pickField(response.responseFields, ['MPI_APPR_CODE', 'approvalCode']),
-      rrn: pickField(response.responseFields, ['MPI_RRN', 'rrn']),
-    },
-  };
-}
-
 function renderAutoPostPage(action, fields) {
   const inputs = Object.entries(fields)
     .filter(([, v]) => v !== undefined && v !== null && v !== '')
@@ -1121,58 +799,328 @@ function renderMessagePage(title, message, details) {
 </html>`;
 }
 
-function renderResultPage(tx, paymentStatus, finalResult) {
-  const statusTone = paymentStatus === 'SUCCESS' ? '#0f9b63' : paymentStatus === 'FAILED' ? '#c62828' : '#c27a00';
+function renderResultPage(tx, paymentStatus, finalResult, homeUrl = '/') {
+  const isSuccess = paymentStatus === 'SUCCESS';
   const responseCode = finalResult?.responseCode || '';
   const responseReason = getResponseReasonFromCode(responseCode, finalResult?.responseReason || '');
 
-  const rows = [
-    ['Payment status', paymentStatus],
-    ['Reference number (RRN)', finalResult?.referenceNumber || '—'],
-    ['Authorization code', finalResult?.authorizationCode || '—'],
-    ['Response code', responseCode || '—'],
-    ['Response reason', responseReason || '—'],
-  ].map(([label, value]) => `
-      <div class="row">
-        <div class="label">${escapeHtml(label)}</div>
-        <div class="value">${escapeHtml(value)}</div>
-      </div>`).join('');
+  const CURRENCY_NAMES = {
+    '840': 'USD', '356': 'INR', '064': 'BTN', '524': 'NPR', '144': 'LKR',
+    '586': 'PKR', '050': 'BDT', '702': 'SGD', '978': 'EUR', '826': 'GBP',
+    '036': 'AUD', '124': 'CAD', '392': 'JPY', '156': 'CNY', '410': 'KRW',
+  };
 
-  return `<!doctype html>
-<html>
+  const currencyCode = tx?.currency || '';
+  const currencyDisplay = CURRENCY_NAMES[currencyCode] || currencyCode || '';
+  const amountFormatted = tx?.amountMajor
+    ? (currencyDisplay ? currencyDisplay + ' ' : '') + parseFloat(tx.amountMajor).toFixed(2)
+    : '—';
+
+  let txDate = '';
+  try {
+    txDate = tx.createdAt
+      ? new Date(tx.createdAt).toLocaleString('en-GB', {
+          day: '2-digit', month: 'short', year: 'numeric',
+          hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true,
+        })
+      : new Date().toLocaleString('en-GB');
+  } catch { txDate = tx.createdAt || new Date().toString(); }
+
+  const accentColor  = isSuccess ? '#059669' : '#dc2626';
+  const statusColor  = isSuccess ? '#065f46' : '#7f1d1d';
+  const statusBg     = isSuccess ? '#ecfdf5' : '#fef2f2';
+  const statusBorder = isSuccess ? '#6ee7b7' : '#fca5a5';
+  const iconBg       = isSuccess ? '#10b981' : '#ef4444';
+  const statusLabel  = isSuccess ? 'Payment Successful' : 'Payment Failed';
+  const reasonText   = responseReason || (isSuccess ? 'Transaction approved' : 'Transaction declined');
+
+  // Build detail rows
+  const rowDefs = [
+    { lbl: 'Transaction ID',          val: tx.txnId,                             type: 'mono'   },
+    { lbl: 'Order Reference',         val: tx.orderRef,                          type: 'mono'   },
+    { lbl: 'Amount',                  val: amountFormatted,                      type: 'amount' },
+    ...(isSuccess ? [{ lbl: 'Authorization Code', val: finalResult?.authorizationCode || '—', type: 'mono' }] : []),
+    { lbl: 'Reference Number (RRN)',  val: finalResult?.referenceNumber || '—',  type: 'mono'   },
+    { lbl: 'Response Code',           val: responseCode || '—',                  type: 'mono'   },
+    { lbl: 'Response Description',    val: reasonText,                           type: 'text'   },
+    { lbl: 'Merchant ID',             val: tx.merchantId || '—',                 type: 'mono'   },
+    ...(tx.customerName ? [{ lbl: 'Customer Name', val: tx.customerName, type: 'text' }] : []),
+    { lbl: 'Transaction Date & Time', val: txDate,                               type: 'text'   },
+    { lbl: 'Payment Status',          val: paymentStatus,                        type: 'status' },
+  ];
+
+  const tableRows = rowDefs.map(r => {
+    const valStyle =
+      r.type === 'mono'   ? 'font-family:Consolas,monospace;color:#1e293b' :
+      r.type === 'amount' ? 'font-size:20px;font-weight:700;color:' + accentColor :
+      r.type === 'status' ? 'font-weight:700;color:' + statusColor :
+      'color:#1e293b';
+    return '<tr>' +
+      '<td style="padding:11px 14px 11px 0;font-size:12.5px;font-weight:600;color:#64748b;' +
+        'border-bottom:1px solid #f1f5f9;width:42%;vertical-align:top">' + escapeHtml(r.lbl) + '</td>' +
+      '<td style="padding:11px 0;font-size:13px;word-break:break-word;border-bottom:1px solid #f1f5f9;' +
+        'vertical-align:top;' + valStyle + '">' + escapeHtml(String(r.val || '—')) + '</td>' +
+      '</tr>';
+  }).join('');
+
+  // Payload for client-side receipt download (JSON-safe)
+  const receiptPayload = JSON.stringify({
+    isSuccess,
+    statusLabel,
+    accentColor,
+    statusColor,
+    statusBg,
+    statusBorder,
+    iconBg,
+    txnId:        tx.txnId || '',
+    orderRef:     tx.orderRef || '',
+    amount:       amountFormatted,
+    authCode:     (isSuccess ? finalResult?.authorizationCode : '') || '',
+    rrn:          finalResult?.referenceNumber || '',
+    responseCode: responseCode || '',
+    responseReason: reasonText,
+    merchantId:   tx.merchantId || '',
+    customerName: tx.customerName || '',
+    txDate,
+    status:       paymentStatus,
+  }).replace(/<\/script>/gi, '<\\/script>');
+
+  return `<!doctype html><html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Payment Result</title>
+  <title>Payment Receipt \u2014 ${escapeHtml(tx.txnId)}</title>
   <style>
-    body{font-family:Arial,sans-serif;background:linear-gradient(180deg,#f8fbff 0%,#eef3fb 100%);padding:24px;color:#111827}
-    .card{max-width:760px;margin:0 auto;background:#fff;padding:26px;border-radius:18px;box-shadow:0 18px 40px rgba(15,23,42,.10);border:1px solid #e7edf8}
-    .badge{display:inline-block;padding:8px 12px;border-radius:999px;font-weight:700;color:#fff;background:${statusTone};margin-bottom:14px}
-    h1{margin:0 0 8px;font-size:30px}
-    .meta{color:#5f6f86;font-size:14px;margin:0 0 18px}
-    .grid{display:grid;gap:12px}
-    .row{display:flex;justify-content:space-between;gap:16px;padding:14px 16px;border:1px solid #e5e7eb;border-radius:12px;background:#fafcff}
-    .label{font-weight:600;color:#334155}
-    .value{text-align:right;word-break:break-word}
-    .actions{margin-top:18px;display:flex;justify-content:flex-end}
-    .home-btn{display:inline-flex;align-items:center;justify-content:center;padding:11px 16px;border-radius:10px;background:#165dff;color:#fff;text-decoration:none;font-weight:600;box-shadow:0 6px 14px rgba(22,93,255,.25)}
-    .home-btn:hover{background:#0f4ed8}
-    @media (max-width:640px){.row{flex-direction:column}.value{text-align:left}}
+    *,*::before,*::after{box-sizing:border-box;}
+    body{margin:0;padding:32px 16px;background:#f1f5f9;font-family:'Segoe UI',Arial,sans-serif;color:#1e293b;min-height:100vh;}
+    .wrap{max-width:660px;margin:0 auto;}
+    /* ── Bank header ── */
+    .hdr{background:linear-gradient(135deg,#0f2d5e 0%,#1a4a8a 100%);border-radius:16px 16px 0 0;padding:20px 28px;
+      display:flex;align-items:center;gap:14px;}
+    .hdr-icon{width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.18);
+      display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0;}
+    .hdr-title{font-size:17px;font-weight:700;color:#fff;letter-spacing:.2px;}
+    .hdr-sub{font-size:11.5px;color:rgba(255,255,255,.6);margin-top:2px;}
+    /* ── Card ── */
+    .card{background:#fff;border-radius:0 0 16px 16px;box-shadow:0 20px 60px rgba(15,45,94,.15);overflow:hidden;}
+    /* ── Status banner ── */
+    .sbanner{background:${statusBg};border-bottom:2px solid ${statusBorder};
+      padding:24px 28px;display:flex;align-items:center;gap:18px;}
+    .sicon{width:54px;height:54px;flex-shrink:0;border-radius:50%;background:${iconBg};color:#fff;
+      display:flex;align-items:center;justify-content:center;font-size:26px;font-weight:700;
+      box-shadow:0 6px 18px ${iconBg}55;}
+    .slabel{font-size:21px;font-weight:700;color:${statusColor};}
+    .stxn{font-size:12px;color:#64748b;margin-top:3px;}
+    /* ── Details ── */
+    .body{padding:22px 28px;}
+    .sec-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.9px;color:#94a3b8;
+      margin-bottom:14px;padding-bottom:8px;border-bottom:1px solid #e2e8f0;}
+    table{width:100%;border-collapse:collapse;}
+    /* ── Action buttons ── */
+    .actions{padding:18px 28px 22px;display:flex;gap:10px;flex-wrap:wrap;}
+    .btn{flex:1;min-width:130px;display:inline-flex;align-items:center;justify-content:center;gap:7px;
+      padding:11px 16px;border-radius:10px;font-size:13.5px;font-weight:600;cursor:pointer;
+      border:none;text-decoration:none;transition:opacity .15s,transform .1s;}
+    .btn:active{transform:scale(.97);}
+    .btn-dl{background:${accentColor};color:#fff;}
+    .btn-dl:hover{opacity:.88;}
+    .btn-print{background:#f1f5f9;color:#334155;border:1px solid #cbd5e1;}
+    .btn-print:hover{background:#e2e8f0;}
+    .btn-home{background:#0f2d5e;color:#fff;}
+    .btn-home:hover{background:#1a3f70;}
+    /* ── Footer ── */
+    .ftr{padding:14px 28px 18px;background:#f8fafc;border-top:1px solid #e2e8f0;
+      font-size:11px;color:#94a3b8;text-align:center;line-height:1.7;}
+    /* ── Print styles ── */
+    @media print{
+      body{background:#fff;padding:0;}
+      .wrap{max-width:100%;}
+      .hdr{background:#0f2d5e!important;-webkit-print-color-adjust:exact;print-color-adjust:exact;border-radius:0;}
+      .card{box-shadow:none;border-radius:0;}
+      .actions{display:none!important;}
+      .ftr{font-size:9px;}
+      @page{margin:12mm;}
+    }
+    @media(max-width:580px){
+      .hdr,.body,.actions,.ftr{padding-left:16px;padding-right:16px;}
+      .sbanner{padding-left:16px;padding-right:16px;}
+    }
   </style>
 </head>
 <body>
-  <div class="card">
-    <div class="badge">${escapeHtml(paymentStatus)}</div>
-    <h1>Payment Result</h1>
-    <p class="meta">Transaction ID: ${escapeHtml(tx.txnId)}${tx.orderRef ? ` • Order Ref: ${escapeHtml(tx.orderRef)}` : ''}</p>
-    <div class="grid">${rows}
+  <div class="wrap">
+    <div class="hdr">
+      <div class="hdr-icon">&#127974;</div>
+      <div>
+        <div class="hdr-title">Secure Payment Gateway</div>
+        <div class="hdr-sub">Official Electronic Payment Receipt</div>
+      </div>
     </div>
-    <div class="actions">
-      <a class="home-btn" href="https://standalone-ip-gintegration.vercel.app/">Back to Home</a>
+    <div class="card">
+      <div class="sbanner">
+        <div class="sicon">${isSuccess ? '&#10004;' : '&#10008;'}</div>
+        <div>
+          <div class="slabel">${escapeHtml(statusLabel)}</div>
+          <div class="stxn">Transaction ID: ${escapeHtml(tx.txnId)}</div>
+        </div>
+      </div>
+      <div class="body">
+        <div class="sec-title">Transaction Details</div>
+        <table>${tableRows}</table>
+      </div>
+      <div class="actions">
+        <button class="btn btn-dl" onclick="downloadReceiptPdf()">&#8659;&nbsp;Download PDF Receipt</button>
+        <button class="btn btn-print" onclick="window.print()">&#128438;&nbsp;Print Receipt</button>
+        <a class="btn btn-home" href="${escapeHtml(homeUrl)}">&#8592;&nbsp;Back to Home</a>
+      </div>
+      <div class="ftr">
+        This is an official electronic receipt issued by the Secure Payment Gateway.<br>
+        Retain a copy for your records. For disputes or queries, share this receipt with the merchant or portal owner.
+      </div>
     </div>
   </div>
-</body>
-</html>`;
+  <script>
+    var R=${receiptPayload};
+    function downloadReceiptPdf(){
+      if (!R || !R.txnId) return;
+      window.location.href = '/api/receipt.pdf?txnId=' + encodeURIComponent(R.txnId);
+    }
+  </script>
+</body></html>`;
+}
+
+async function generateReceiptPdfBuffer(tx, paymentStatus, finalResult) {
+  const isSuccess = paymentStatus === 'SUCCESS';
+  const responseCode = String(finalResult?.responseCode || '').trim();
+  const responseReason = getResponseReasonFromCode(responseCode, finalResult?.responseReason || '');
+  const CURRENCY_NAMES = {
+    '840': 'USD', '356': 'INR', '064': 'BTN', '524': 'NPR', '144': 'LKR',
+    '586': 'PKR', '050': 'BDT', '702': 'SGD', '978': 'EUR', '826': 'GBP',
+    '036': 'AUD', '124': 'CAD', '392': 'JPY', '156': 'CNY', '410': 'KRW',
+  };
+
+  const currencyCode = tx?.currency || '';
+  const currencyDisplay = CURRENCY_NAMES[currencyCode] || currencyCode || '';
+  const amountFormatted = tx?.amountMajor
+    ? `${currencyDisplay ? `${currencyDisplay} ` : ''}${Number.parseFloat(tx.amountMajor).toFixed(2)}`
+    : '—';
+
+  const txDate = tx?.createdAt
+    ? new Date(tx.createdAt).toLocaleString('en-GB', {
+        day: '2-digit', month: 'short', year: 'numeric',
+        hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true,
+      })
+    : new Date().toLocaleString('en-GB');
+
+  const rows = [
+    ['Transaction ID', tx.txnId || '—'],
+    ['Order Reference', tx.orderRef || '—'],
+    ['Amount', amountFormatted],
+    ...(isSuccess ? [['Authorization Code', finalResult?.authorizationCode || '—']] : []),
+    ['Reference Number (RRN)', finalResult?.referenceNumber || '—'],
+    ['Response Code', responseCode || '—'],
+    ['Response Description', responseReason || (isSuccess ? 'Transaction approved' : 'Transaction declined')],
+    ['Merchant ID', tx.merchantId || '—'],
+    ...(tx.customerName ? [['Customer Name', tx.customerName]] : []),
+    ['Transaction Date & Time', txDate],
+    ['Payment Status', paymentStatus],
+  ];
+
+  return await new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ size: 'A4', margin: 50 });
+    const chunks = [];
+    doc.on('data', c => chunks.push(c));
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+
+    const accent = isSuccess ? '#059669' : '#dc2626';
+
+    doc.fillColor('#0f2d5e').font('Helvetica-Bold').fontSize(18).text('Secure Payment Gateway');
+    doc.moveDown(0.2);
+    doc.fillColor('#64748b').font('Helvetica').fontSize(10).text('Official Electronic Payment Receipt');
+    doc.moveDown(1);
+
+    doc.fillColor(accent).font('Helvetica-Bold').fontSize(14).text(isSuccess ? 'Payment Successful' : 'Payment Failed');
+    doc.moveDown(0.3);
+    doc.fillColor('#334155').font('Helvetica').fontSize(10).text(`Transaction ID: ${tx.txnId || '—'}`);
+    doc.moveDown(1);
+
+    const startX = doc.x;
+    let y = doc.y;
+    const labelWidth = 190;
+    const valueX = startX + labelWidth;
+    const rowGap = 8;
+
+    for (const [label, value] of rows) {
+      doc.fillColor('#64748b').font('Helvetica-Bold').fontSize(10).text(label, startX, y, { width: labelWidth - 10 });
+      doc.fillColor('#111827').font('Helvetica').fontSize(10).text(String(value || '—'), valueX, y, { width: 320 });
+      y = Math.max(doc.y, y) + rowGap;
+      doc.moveTo(startX, y - 4).lineTo(545, y - 4).strokeColor('#e5e7eb').lineWidth(0.5).stroke();
+    }
+
+    doc.moveDown(1.2);
+    doc.fillColor('#94a3b8').font('Helvetica').fontSize(9)
+      .text('This is an official electronic receipt issued by the Secure Payment Gateway.', 50, y + 14)
+      .text('Retain a copy for your records. For disputes, share this receipt with the merchant or portal owner.');
+
+    doc.end();
+  });
+}
+
+async function handleReceiptPdf(req, res) {
+  const u = new URL(req.url, `http://${req.headers.host}`);
+  const txnId = String(u.searchParams.get('txnId') || '').trim();
+
+  if (!txnId) {
+    return html(res, 400, renderMessagePage('Invalid request', 'txnId is required to download receipt.'));
+  }
+
+  const tx = await getTransaction(txnId);
+  if (!tx) {
+    return html(res, 404, renderMessagePage('Transaction not found', 'No transaction record found for this reference.', { txnId }));
+  }
+
+  const callbackReceived = !!tx.callback;
+  const callbackResultTrusted = !tx.macVerification?.hasMac || !!tx.macVerification?.macVerified;
+  let finalResult = tx.finalResult;
+
+  if (finalResult?.source === 'callback' && !callbackResultTrusted) {
+    finalResult = null;
+  }
+
+  if (!finalResult && callbackResultTrusted) {
+    finalResult = buildFinalResultRecord({
+      fields: tx.callback?.fields,
+      source: 'callback',
+      resolvedAt: tx.callback?.receivedAt,
+    });
+  }
+
+  const effectiveStatus = mapTransactionLifecycleStatus({
+    callbackReceived,
+    finalResult,
+  });
+
+  if (effectiveStatus === 'PENDING') {
+    return html(
+      res,
+      202,
+      renderMessagePage('Payment processing', 'Payment is still processing. Try downloading receipt after completion.', {
+        txnId,
+        status: effectiveStatus,
+      })
+    );
+  }
+
+  const safeTxnId = String(tx.txnId || '').replace(/[^a-zA-Z0-9_-]/g, '') || 'transaction';
+  const pdfBuffer = await generateReceiptPdfBuffer(tx, effectiveStatus, finalResult);
+
+  res.statusCode = 200;
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename="payment-receipt-${safeTxnId}.pdf"`);
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Content-Length', String(pdfBuffer.length));
+  return res.end(pdfBuffer);
 }
 
 function renderDeveloperHome(baseUrl) {
@@ -1184,8 +1132,6 @@ function renderDeveloperHome(baseUrl) {
   <p>This deployment is backend-only. Customer checkout UI must be hosted on merchant website.</p>
   <ul>
     <li>POST ${escapeHtml(baseUrl)}/api/initiate</li>
-    <li>POST ${escapeHtml(baseUrl)}/api/refund/lookup</li>
-    <li>POST ${escapeHtml(baseUrl)}/api/refund/initiate</li>
     <li>POST ${escapeHtml(baseUrl)}/callback</li>
     <li>GET/POST ${escapeHtml(baseUrl)}/return</li>
     <li>GET ${escapeHtml(baseUrl)}/health</li>
@@ -1200,245 +1146,272 @@ function renderPublicCheckoutPage(baseUrl) {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Business Payment Portal</title>
+  <title>Secure Payment Portal</title>
   <style>
     :root{
-      --bg:#f4f7fb;
+      --bg:#eef3fb;
       --card:#ffffff;
       --text:#10213a;
       --muted:#5f6f86;
-      --brand:#165dff;
-      --brand-2:#0e4bd4;
-      --border:#dce5f2;
+      --brand:#0f2d5e;
+      --brand-2:#1a4a8a;
+      --accent:#165dff;
+      --accent-2:#0e4bd4;
+      --border:#d9e3f3;
       --ok:#0f9b63;
+      --warn:#c27a00;
     }
     *{box-sizing:border-box}
     body{
       margin:0;
-      font-family:Inter,Segoe UI,Arial,sans-serif;
+      font-family:Segoe UI,Arial,sans-serif;
       color:var(--text);
       background:linear-gradient(180deg,#f8fbff 0%, var(--bg) 100%);
       min-height:100vh;
-      display:flex;
-      align-items:center;
-      justify-content:center;
-      padding:24px 14px;
+      padding:28px 14px;
     }
-    .container{width:100%;max-width:680px}
+    .container{width:100%;max-width:940px;margin:0 auto}
+    .layout{display:grid;grid-template-columns:1.2fr .8fr;gap:18px}
     .card{
       background:var(--card);
       border:1px solid var(--border);
       border-radius:18px;
       box-shadow:0 16px 40px rgba(16,33,58,.10);
-      padding:24px 22px;
+      overflow:hidden;
     }
-    .heading{margin-bottom:16px}
-    .title{margin:0 0 6px;font-size:26px;line-height:1.2}
-    .subtitle{margin:0;color:var(--muted);font-size:14px}
-    .tabs{display:flex;gap:8px;margin:14px 0 8px}
-    .tab-btn{flex:1;border:1px solid var(--border);background:#f8fbff;color:#243a5e;border-radius:10px;padding:10px 12px;cursor:pointer;font-weight:600}
-    .tab-btn.active{background:linear-gradient(180deg,var(--brand),var(--brand-2));border-color:var(--brand-2);color:#fff}
-    .panel{display:none}
-    .panel.active{display:block}
-    .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:12px}
+    .bank-head{
+      background:linear-gradient(135deg,var(--brand) 0%,var(--brand-2) 100%);
+      padding:18px 22px;
+      color:#fff;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:12px;
+    }
+    .bank-brand{display:flex;align-items:center;gap:10px}
+    .bank-icon{
+      width:42px;height:42px;border-radius:999px;
+      background:rgba(255,255,255,.16);
+      display:flex;align-items:center;justify-content:center;
+      font-size:20px;
+    }
+    .bank-title{font-size:17px;font-weight:700;letter-spacing:.2px}
+    .bank-sub{font-size:11.5px;opacity:.78;margin-top:2px}
+    .bank-badge{
+      font-size:11px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;
+      padding:7px 10px;border-radius:999px;background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.28)
+    }
+    .panel-body{padding:20px 22px 22px}
+    .heading{margin-bottom:14px}
+    .title{margin:0 0 5px;font-size:24px;line-height:1.2}
+    .subtitle{margin:0;color:var(--muted);font-size:13.5px}
+    .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:13px;margin-top:12px}
     .field{display:flex;flex-direction:column;gap:6px}
     .field.full{grid-column:1 / -1}
-    label{font-size:13px;color:#2c3f5f;font-weight:600}
+    label{font-size:12.5px;color:#2c3f5f;font-weight:700}
     input,textarea{
       width:100%;
       border:1px solid #cfdced;
       background:#fff;
       color:#10213a;
       border-radius:10px;
-      padding:12px 12px;
+      padding:11px 12px;
       outline:none;
       transition:border-color .2s,box-shadow .2s;
-      font-size:14px;
+      font-size:13.5px;
     }
-    textarea{resize:vertical;min-height:92px}
-    input:focus,textarea:focus{border-color:var(--brand);box-shadow:0 0 0 3px rgba(22,93,255,.12)}
+    textarea{resize:vertical;min-height:88px}
+    input:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(22,93,255,.12)}
     .section-label{
       grid-column:1 / -1;
       margin-top:4px;
-      font-size:12px;
+      font-size:11px;
       font-weight:700;
-      color:#4b5f80;
+      color:#60708c;
       text-transform:uppercase;
-      letter-spacing:.4px;
+      letter-spacing:.8px;
+      padding-bottom:7px;
+      border-bottom:1px solid #e6edf8;
     }
+    .currency-pill{
+      display:inline-flex;align-items:center;gap:6px;
+      border:1px solid #d6e2f2;background:#f6f9ff;color:#26446d;
+      border-radius:999px;padding:5px 9px;font-size:11px;font-weight:700;
+    }
+    .button-row{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}
     .submit{
-      margin-top:18px;
-      width:100%;
-      background:linear-gradient(180deg,var(--brand),var(--brand-2));
+      flex:1;
+      min-width:240px;
+      background:linear-gradient(180deg,var(--accent),var(--accent-2));
       color:white;
       border:0;
       border-radius:10px;
-      padding:13px 16px;
-      font-weight:600;
+      padding:12px 16px;
+      font-weight:700;
       cursor:pointer;
     }
+    .submit:hover{filter:brightness(.98)}
     .secondary{
-      margin-top:12px;
-      width:100%;
+      flex:1;
+      min-width:210px;
       background:#f0f4f9;
       color:var(--text);
       border:1px solid var(--border);
       border-radius:10px;
-      padding:11px 16px;
-      font-weight:500;
+      padding:12px 16px;
+      font-weight:600;
       cursor:pointer;
-      font-size:14px;
+      font-size:13.5px;
     }
     .secondary:hover{background:#e8ecf4}
-    .link-panel{display:none}
+    .link-panel{display:none;margin-top:12px;border:1px solid #dbe6f5;border-radius:12px;padding:12px;background:#f8fbff}
     .link-panel.active{display:block}
-    .link-panel h3{margin:16px 0 8px;font-size:16px}
+    .link-panel h3{margin:2px 0 8px;font-size:15px}
     .link-panel p{margin:6px 0;color:var(--muted);font-size:13px}
     .link-output{display:flex;gap:8px;margin:10px 0}
-    .link-output input{flex:1;font-size:12px;padding:10px}
-    .link-output button{flex:0 0 auto;width:auto;margin-top:0}
+    .link-output input{flex:1;font-size:12px;padding:10px;border-radius:8px}
+    .link-output button{flex:0 0 auto;width:auto;margin-top:0;min-width:100px}
     .tiny{font-size:12px;color:#8a9aad}
+
+    .side{
+      background:#fff;
+      border:1px solid var(--border);
+      border-radius:18px;
+      box-shadow:0 16px 40px rgba(16,33,58,.08);
+      padding:16px;
+      height:fit-content;
+    }
+    .side h3{margin:0 0 8px;font-size:15px;color:#17345f}
+    .side p{margin:0;color:#60708c;font-size:12.8px;line-height:1.55}
     .trust{
-      margin-top:16px;
+      margin-top:12px;
       padding:12px;
       border:1px solid #dde8f6;
       border-radius:10px;
       background:#f8fbff;
     }
     .trust ul{margin:0;padding:0;list-style:none;display:grid;gap:8px}
-    .trust li{display:flex;align-items:center;gap:8px;color:#3c4f6e;font-size:13px}
+    .trust li{display:flex;align-items:center;gap:8px;color:#3c4f6e;font-size:12.8px}
     .dot{height:8px;width:8px;border-radius:999px;background:var(--ok);flex:none}
-    .result-box{margin-top:12px;padding:12px;border-radius:10px;border:1px solid #dae4f3;background:#f8fbff}
-    .result-box h3{margin:0 0 8px;font-size:15px}
-    .result-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px 14px}
-    .result-item{font-size:13px}
-    .result-item strong{display:block;color:#4b5f80;font-size:12px;margin-bottom:2px}
-    .status-note{margin-top:10px;font-size:13px;color:#2c3f5f}
+
+    .notice{
+      margin-top:10px;
+      border:1px solid #fde6b7;
+      background:#fffbf0;
+      color:#7a5b1d;
+      padding:10px 11px;
+      border-radius:10px;
+      font-size:12px;
+      line-height:1.45;
+    }
+    .footnote{margin-top:12px;color:#8fa0ba;font-size:11px;line-height:1.45}
+
+    @media (max-width:980px){
+      .layout{grid-template-columns:1fr}
+      .side{order:2}
+    }
     @media (max-width:900px){
       .form-grid{grid-template-columns:1fr}
-      .result-grid{grid-template-columns:1fr}
+      .button-row{flex-direction:column}
+      .submit,.secondary{min-width:0;width:100%}
     }
   </style>
 </head>
 <body>
   <div class="container">
-    <section class="card">
-      <div class="heading">
-        <h1 class="title">Business Payment Portal</h1>
-        <p class="subtitle">A standalone payment page for registered merchants to securely collect customer payments.</p>
-      </div>
-
-      <div class="tabs">
-        <button class="tab-btn active" id="tabPayment" type="button">Make Payment</button>
-        <button class="tab-btn" id="tabRefund" type="button">Refund</button>
-      </div>
-
-      <section class="panel active" id="panelPayment">
-
-      <form id="checkoutForm" method="post" action="/api/initiate" autocomplete="on">
-        <div class="form-grid">
-          <div class="section-label">Payment Details</div>
-
-          <div class="field">
-            <label for="merchantId">Merchant ID</label>
-            <input id="merchantId" name="merchantId" required placeholder="Enter registered MID" />
+    <div class="layout">
+      <section class="card">
+        <div class="bank-head">
+          <div class="bank-brand">
+            <div class="bank-icon">&#127974;</div>
+            <div>
+              <div class="bank-title">Secure Payment Gateway</div>
+              <div class="bank-sub">Bank-grade card processing portal</div>
+            </div>
           </div>
-
-          <div class="field" style="position:relative">
-            <label for="amount"><span id="currencyLabel" style="font-weight:600"></span> Amount</label>
-            <input id="amount" name="amount" type="number" required min="0.01" step="0.01" placeholder="0.00" />
-          </div>
-
-          <div class="section-label">Customer Details</div>
-
-          <div class="field">
-            <label for="customerName">Customer Name</label>
-            <input id="customerName" name="customerName" placeholder="Enter customer full name" />
-          </div>
-
-          <div class="field">
-            <label for="email">Customer Email</label>
-            <input id="email" name="email" type="email" placeholder="Enter customer email" />
-          </div>
-
-          <div class="field full">
-            <label for="paymentDescription">Payment Description</label>
-            <textarea id="paymentDescription" name="paymentDescription" placeholder="Describe service or purpose of payment"></textarea>
-          </div>
+          <div class="bank-badge">3D Secure</div>
         </div>
 
-        <input id="currency" name="currency" type="hidden" value="" />
-
-        <button class="submit" type="submit">Proceed to Secure Payment</button>
-        <button class="secondary" type="button" id="generateLinkButton">Generate Payment Link</button>
-
-        <div class="link-panel" id="paymentLinkPanel">
-          <h3>Shareable payment link</h3>
-          <p>Send this link to the cardholder. Opening it will start the secure Cardzone payment flow.</p>
-          <div class="link-output">
-            <input id="paymentLinkOutput" readonly value="" />
-            <button class="secondary" type="button" id="copyLinkButton">Copy Link</button>
+        <div class="panel-body">
+          <div class="heading">
+            <h1 class="title">Business Payment Portal</h1>
+            <p class="subtitle">Initiate card transactions through a secure hosted banking flow and receive professional digital receipts.</p>
           </div>
-          <p class="tiny" id="paymentLinkMeta"></p>
+
+          <form id="checkoutForm" method="post" action="/api/initiate" autocomplete="on">
+            <div class="form-grid">
+              <div class="section-label">Payment Details</div>
+
+              <div class="field">
+                <label for="merchantId">Merchant ID</label>
+                <input id="merchantId" name="merchantId" required placeholder="Enter registered MID" />
+              </div>
+
+              <div class="field" style="position:relative">
+                <label for="amount">Amount <span id="currencyPill" class="currency-pill" style="display:none">Currency: <span id="currencyLabel"></span></span></label>
+                <input id="amount" name="amount" type="number" required min="0.01" step="0.01" placeholder="0.00" />
+              </div>
+
+              <div class="section-label">Customer Details</div>
+
+              <div class="field">
+                <label for="customerName">Customer Name</label>
+                <input id="customerName" name="customerName" placeholder="Enter customer full name" />
+              </div>
+
+              <div class="field">
+                <label for="email">Customer Email</label>
+                <input id="email" name="email" type="email" placeholder="Enter customer email" />
+              </div>
+
+              <div class="field full">
+                <label for="paymentDescription">Payment Description</label>
+                <textarea id="paymentDescription" name="paymentDescription" placeholder="Describe service or purpose of payment"></textarea>
+              </div>
+            </div>
+
+            <input id="currency" name="currency" type="hidden" value="" />
+
+            <div class="button-row">
+              <button class="submit" type="submit" id="proceedButton">Proceed to Secure Payment</button>
+              <button class="secondary" type="button" id="generateLinkButton">Generate Payment Link</button>
+            </div>
+
+            <div class="link-panel" id="paymentLinkPanel">
+              <h3>Shareable payment link</h3>
+              <p>Send this link to the cardholder. Opening it will start the secure Cardzone payment flow.</p>
+              <div class="link-output">
+                <input id="paymentLinkOutput" readonly value="" />
+                <button class="secondary" type="button" id="copyLinkButton">Copy Link</button>
+              </div>
+              <p class="tiny" id="paymentLinkMeta"></p>
+            </div>
+          </form>
+
+          <div class="notice">
+            Use only registered merchant details. After payment completion, a professional receipt with downloadable PDF is available for customer support and dispute handling.
+          </div>
+
+          <div class="footnote">
+            Gateway: ${escapeHtml(baseUrl)} • End-to-end hosted transaction flow.
+          </div>
         </div>
-      </form>
       </section>
 
-      <section class="panel" id="panelRefund">
-        <div class="form-grid">
-          <div class="section-label">Refund Lookup</div>
-
-          <div class="field">
-            <label for="refundMerchantId">Merchant ID</label>
-            <input id="refundMerchantId" placeholder="Enter registered MID" />
-          </div>
-
-          <div class="field">
-            <label for="refundOriginalTxnId">Original Transaction ID</label>
-            <input id="refundOriginalTxnId" placeholder="Enter original txn id" />
-          </div>
-
-          <div class="field full">
-            <label for="refundTerminalId">Virtual Terminal ID (optional)</label>
-            <input id="refundTerminalId" placeholder="Enter virtual terminal id (if required)" />
-          </div>
-        </div>
-
-        <button class="secondary" type="button" id="refundLookupButton">Fetch Transaction Details</button>
-
-        <div class="result-box" id="refundLookupResult" style="display:none">
-          <h3>Transaction Details</h3>
-          <div class="result-grid">
-            <div class="result-item"><strong>Transaction ID</strong><span id="vTxnId">-</span></div>
-            <div class="result-item"><strong>Amount</strong><span id="vAmount">-</span></div>
-            <div class="result-item"><strong>Currency</strong><span id="vCurrency">-</span></div>
-            <div class="result-item"><strong>Approval Code</strong><span id="vApprovalCode">-</span></div>
-            <div class="result-item"><strong>RRN</strong><span id="vRrn">-</span></div>
-            <div class="result-item"><strong>Response Code</strong><span id="vResponseCode">-</span></div>
-            <div class="result-item"><strong>Response Reason</strong><span id="vResponseReason">-</span></div>
-            <div class="result-item"><strong>Status</strong><span id="vStatus">-</span></div>
-          </div>
-        </div>
-
-        <div class="form-grid">
-          <div class="section-label">Refund Action</div>
-          <div class="field full">
-            <label for="refundAmount">Refund Amount</label>
-            <input id="refundAmount" type="number" min="0.01" step="0.01" placeholder="0.00" />
-          </div>
-        </div>
-
-        <button class="submit" type="button" id="refundInitiateButton">Initiate Refund</button>
-        <div class="status-note" id="refundActionResult"></div>
-      </section>
-
+      <aside class="side">
+        <h3>Security & Compliance</h3>
+        <div class="trust">
           <ul>
-            <li><span class="dot"></span><span>Secure payment processing</span></li>
-            <li><span class="dot"></span><span>3D Secure authentication</span></li>
-            <li><span class="dot"></span><span>Powered by bank payment gateway</span></li>
+            <li><span class="dot"></span><span>Hosted redirection to secure card entry</span></li>
+            <li><span class="dot"></span><span>3D Secure cardholder authentication</span></li>
+            <li><span class="dot"></span><span>Response-code based transaction validation</span></li>
+            <li><span class="dot"></span><span>Downloadable PDF receipt for support sharing</span></li>
           </ul>
         </div>
-      </section>
+        <div class="notice" style="margin-top:12px;border-color:#d8e7ff;background:#f4f8ff;color:#2c4f83">
+          Recommended: verify MID and amount before submission. For callback troubleshooting, share the receipt and transaction ID with the portal owner.
+        </div>
+      </aside>
     </div>
   </div>
   <script>
@@ -1449,40 +1422,31 @@ function renderPublicCheckoutPage(baseUrl) {
       const customerNameInput = document.getElementById('customerName');
       const emailInput = document.getElementById('email');
       const currencyLabel = document.getElementById('currencyLabel');
+      const currencyPill = document.getElementById('currencyPill');
       const currencyInput = document.getElementById('currency');
+      const proceedButton = document.getElementById('proceedButton');
       const generateLinkButton = document.getElementById('generateLinkButton');
       const copyLinkButton = document.getElementById('copyLinkButton');
       const paymentLinkPanel = document.getElementById('paymentLinkPanel');
       const paymentLinkOutput = document.getElementById('paymentLinkOutput');
       const paymentLinkMeta = document.getElementById('paymentLinkMeta');
-      const tabPayment = document.getElementById('tabPayment');
-      const tabRefund = document.getElementById('tabRefund');
-      const panelPayment = document.getElementById('panelPayment');
-      const panelRefund = document.getElementById('panelRefund');
-
-      const refundMerchantId = document.getElementById('refundMerchantId');
-      const refundOriginalTxnId = document.getElementById('refundOriginalTxnId');
-      const refundTerminalId = document.getElementById('refundTerminalId');
-      const refundAmount = document.getElementById('refundAmount');
-      const refundLookupButton = document.getElementById('refundLookupButton');
-      const refundInitiateButton = document.getElementById('refundInitiateButton');
-      const refundLookupResult = document.getElementById('refundLookupResult');
-      const refundActionResult = document.getElementById('refundActionResult');
-
-      const vTxnId = document.getElementById('vTxnId');
-      const vAmount = document.getElementById('vAmount');
-      const vCurrency = document.getElementById('vCurrency');
-      const vApprovalCode = document.getElementById('vApprovalCode');
-      const vRrn = document.getElementById('vRrn');
-      const vResponseCode = document.getElementById('vResponseCode');
-      const vResponseReason = document.getElementById('vResponseReason');
-      const vStatus = document.getElementById('vStatus');
-
-      let refundLookupData = null;
 
       const currencyCodeToName = {
         '840': 'USD',
-        '356': 'INR'
+        '356': 'INR',
+        '064': 'BTN',
+        '524': 'NPR',
+        '144': 'LKR',
+        '586': 'PKR',
+        '050': 'BDT',
+        '702': 'SGD',
+        '978': 'EUR',
+        '826': 'GBP',
+        '036': 'AUD',
+        '124': 'CAD',
+        '392': 'JPY',
+        '156': 'CNY',
+        '410': 'KRW'
       };
 
       async function updateCurrency() {
@@ -1490,6 +1454,7 @@ function renderPublicCheckoutPage(baseUrl) {
         if (!merchantId) {
           currencyInput.value = '';
           currencyLabel.textContent = '';
+          currencyPill.style.display = 'none';
           return;
         }
 
@@ -1502,6 +1467,7 @@ function renderPublicCheckoutPage(baseUrl) {
           if (!res.ok) {
             currencyInput.value = '';
             currencyLabel.textContent = '';
+            currencyPill.style.display = 'none';
             return;
           }
 
@@ -1510,9 +1476,11 @@ function renderPublicCheckoutPage(baseUrl) {
           currencyInput.value = code;
           const displayName = currencyCodeToName[code] || code;
           currencyLabel.textContent = displayName || '';
+          currencyPill.style.display = displayName ? 'inline-flex' : 'none';
         } catch {
           currencyInput.value = '';
           currencyLabel.textContent = '';
+          currencyPill.style.display = 'none';
         }
       }
 
@@ -1578,124 +1546,15 @@ function renderPublicCheckoutPage(baseUrl) {
         }
       }
 
-      function switchTab(tab) {
-        const showPayment = tab === 'payment';
-        tabPayment.classList.toggle('active', showPayment);
-        tabRefund.classList.toggle('active', !showPayment);
-        panelPayment.classList.toggle('active', showPayment);
-        panelRefund.classList.toggle('active', !showPayment);
-      }
-
-      function setRefundLookupView(data) {
-        refundLookupData = data;
-        vTxnId.textContent = data.txnId || '-';
-        vAmount.textContent = data.amount || '-';
-        vCurrency.textContent = data.currency || '-';
-        vApprovalCode.textContent = data.approvalCode || '-';
-        vRrn.textContent = data.rrn || '-';
-        vResponseCode.textContent = data.responseCode || '-';
-        vResponseReason.textContent = data.responseReason || '-';
-        vStatus.textContent = data.status || '-';
-        refundLookupResult.style.display = 'block';
-      }
-
-      async function lookupRefundTransaction() {
-        const merchantId = (refundMerchantId.value || '').trim();
-        const originalTxnId = (refundOriginalTxnId.value || '').trim();
-        const terminalId = (refundTerminalId.value || '').trim();
-
-        if (!merchantId || !originalTxnId) {
-          window.alert('Merchant ID and Original Transaction ID are required.');
-          return;
-        }
-
-        refundLookupButton.disabled = true;
-        refundLookupButton.textContent = 'Fetching...';
-        refundActionResult.textContent = '';
-
-        try {
-          const res = await fetch('/api/refund/lookup', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Accept': 'application/json'
-            },
-            body: JSON.stringify({
-              merchantId,
-              originalTxnId,
-              terminalId
-            })
-          });
-
-          const data = await res.json();
-          if (!res.ok) {
-            throw new Error(data.error || data.message || 'Lookup failed');
-          }
-
-          setRefundLookupView(data);
-          refundActionResult.textContent = 'Transaction details fetched.';
-        } catch (error) {
-          refundLookupData = null;
-          refundLookupResult.style.display = 'none';
-          refundActionResult.textContent = error.message || 'Lookup failed';
-        } finally {
-          refundLookupButton.disabled = false;
-          refundLookupButton.textContent = 'Fetch Transaction Details';
-        }
-      }
-
-      async function initiateRefund() {
-        const merchantId = (refundMerchantId.value || '').trim();
-        const originalTxnId = (refundOriginalTxnId.value || '').trim();
-        const amount = (refundAmount.value || '').trim();
-
-        if (!merchantId || !originalTxnId || !amount) {
-          window.alert('Merchant ID, Original Transaction ID and Refund Amount are required.');
-          return;
-        }
-
-        refundInitiateButton.disabled = true;
-        refundInitiateButton.textContent = 'Processing...';
-
-        try {
-          const res = await fetch('/api/refund/initiate', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Accept': 'application/json'
-            },
-            body: JSON.stringify({
-              merchantId,
-              originalTxnId,
-              refundAmount: amount
-            })
-          });
-
-          const data = await res.json();
-          if (!res.ok) {
-            throw new Error(data.error || data.message || 'Refund failed');
-          }
-
-          refundActionResult.textContent =
-            'Status: ' + (data.status || 'UNKNOWN') +
-            ' | Approval: ' + (data.approvalCode || '-') +
-            ' | RRN: ' + (data.rrn || '-') +
-            ' | Message: ' + (data.responseReason || data.responseCode || '-');
-        } catch (error) {
-          refundActionResult.textContent = error.message || 'Refund failed';
-        } finally {
-          refundInitiateButton.disabled = false;
-          refundInitiateButton.textContent = 'Initiate Refund';
-        }
+      function handleSubmit() {
+        proceedButton.disabled = true;
+        proceedButton.textContent = 'Redirecting to Bank Gateway...';
       }
 
       midInput.addEventListener('input', updateCurrency);
       generateLinkButton.addEventListener('click', generatePaymentLink);
       copyLinkButton.addEventListener('click', copyPaymentLink);
-      tabPayment.addEventListener('click', () => switchTab('payment'));
-      tabRefund.addEventListener('click', () => switchTab('refund'));
-      refundLookupButton.addEventListener('click', lookupRefundTransaction);
-      refundInitiateButton.addEventListener('click', initiateRefund);
+      form.addEventListener('submit', handleSubmit);
       updateCurrency();
     })();
   </script>
@@ -2089,7 +1948,7 @@ async function handleReturn(req, res) {
     );
   }
 
-  return html(res, 200, renderResultPage(tx, effectiveStatus, finalResult));
+  return html(res, 200, renderResultPage(tx, effectiveStatus, finalResult, getRequestBaseUrl(req)));
 }
 
 async function handleTxDebug(req, res, txnId) {
@@ -2199,160 +2058,6 @@ async function handleCreatePaymentLink(req, res) {
   });
 }
 
-async function handleRefundLookup(req, res) {
-  const raw = await parseBody(req);
-  const contentType = (req.headers['content-type'] || '').toLowerCase();
-  const input = parseRawPayload(raw, contentType);
-
-  const merchantId = String(input.merchantId || '').trim();
-  const originalTxnId = String(input.originalTxnId || '').trim();
-  const terminalId = String(input.terminalId || '').trim();
-
-  if (!merchantId || !originalTxnId) {
-    return json(res, 400, {
-      error: 'merchantId and originalTxnId are required',
-    });
-  }
-
-  async function getLocalSummary() {
-    const localTx = await findStoredTransactionForRefund(merchantId, originalTxnId);
-    if (!localTx) return null;
-    if (String(localTx.merchantId || '').trim() !== merchantId) return null;
-    return mapStoredTransactionToRefundLookup(localTx, originalTxnId);
-  }
-
-  try {
-    const inquiry = await lookupTransactionForRefund({
-      merchantId,
-      originalTxnId,
-      terminalId,
-    });
-
-    if (hasRefundLookupDetails(inquiry.summary)) {
-      return json(res, 200, inquiry.summary);
-    }
-
-    const localSummary = await getLocalSummary();
-    if (localSummary) {
-      return json(res, 200, localSummary);
-    }
-
-    return json(res, 200, {
-      txnId: originalTxnId,
-      amount: '',
-      currency: '',
-      approvalCode: '',
-      rrn: '',
-      responseCode: '',
-      responseReason: 'Inquiry completed but no transaction details were returned by gateway',
-      status: 'UNKNOWN',
-    });
-  } catch (error) {
-    const localSummary = await getLocalSummary();
-    if (localSummary) {
-      return json(res, 200, localSummary);
-    }
-
-    console.error('[Cardzone][refund][lookup] failed:', error.message);
-    return json(res, 502, {
-      error: 'Unable to lookup transaction for refund',
-      message: error.message,
-    });
-  }
-}
-
-async function handleRefundInitiate(req, res) {
-  const raw = await parseBody(req);
-  const contentType = (req.headers['content-type'] || '').toLowerCase();
-  const input = parseRawPayload(raw, contentType);
-
-  const merchantId = String(input.merchantId || '').trim();
-  const originalTxnId = String(input.originalTxnId || '').trim();
-  const refundAmount = String(input.refundAmount || '').trim();
-
-  if (!merchantId || !originalTxnId || !refundAmount) {
-    return json(res, 400, {
-      error: 'merchantId, originalTxnId, and refundAmount are required',
-    });
-  }
-
-  let refundAmountMinor;
-  try {
-    refundAmountMinor = Number.parseInt(amountToMinorUnits(refundAmount), 10);
-  } catch (error) {
-    return json(res, 400, {
-      error: error.message,
-    });
-  }
-
-  try {
-    let original = null;
-
-    try {
-      const inquiry = await lookupTransactionForRefund({
-        merchantId,
-        originalTxnId,
-        terminalId: '',
-      });
-      if (hasRefundLookupDetails(inquiry.summary)) {
-        original = inquiry.summary;
-      }
-    } catch {
-      // Fallback to local transaction record below
-    }
-
-    if (!original) {
-      const localTx = await findStoredTransactionForRefund(merchantId, originalTxnId);
-      if (localTx && String(localTx.merchantId || '').trim() === merchantId) {
-        original = mapStoredTransactionToRefundLookup(localTx, originalTxnId);
-      }
-    }
-
-    if (!original || !original.txnId) {
-      return json(res, 400, {
-        error: 'originalTxnId does not exist',
-      });
-    }
-
-    const originalAmountMinor = toMinorUnitsFromGatewayAmount(original.amount);
-    if (!originalAmountMinor) {
-      return json(res, 400, {
-        error: 'Original transaction amount is unavailable for refund validation',
-      });
-    }
-
-    if (!isApprovedResponseCode(original.responseCode) || !original.approvalCode) {
-      return json(res, 400, {
-        error: 'Original transaction is not successful and cannot be refunded',
-        responseCode: original.responseCode,
-        responseReason: original.responseReason,
-      });
-    }
-
-    if (refundAmountMinor > originalAmountMinor) {
-      return json(res, 400, {
-        error: 'refundAmount cannot be greater than original transaction amount',
-        originalAmount: original.amount,
-        refundAmountMinor: String(refundAmountMinor),
-      });
-    }
-
-    const refund = await initiateRefundRequest({
-      merchantId,
-      originalTxnId,
-      refundAmountMinor,
-    });
-
-    return json(res, 200, refund.result);
-  } catch (error) {
-    console.error('[Cardzone][refund][initiate] failed:', error.message);
-    return json(res, 502, {
-      error: 'Unable to initiate refund',
-      message: error.message,
-    });
-  }
-}
-
 async function handlePaymentLinkLanding(req, res, token) {
   const paymentLink = await getPaymentLink(token);
   if (!paymentLink) {
@@ -2387,10 +2092,9 @@ function handleHealth(req, res) {
 
 module.exports = async function handler(req, res) {
   try {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, Authorization');
-
+    res.setHeader('Access-Control-Allow-Origin', process.env.CORS_ORIGIN || '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept');
     if (req.method === 'OPTIONS') {
       res.statusCode = 204;
       return res.end();
@@ -2420,14 +2124,6 @@ module.exports = async function handler(req, res) {
       return await handleCreatePaymentLink(req, res);
     }
 
-    if (req.method === 'POST' && (u.pathname === '/api/refund/lookup' || u.pathname === '/api/refund/lookup/' || u.pathname === '/refund/lookup')) {
-      return await handleRefundLookup(req, res);
-    }
-
-    if (req.method === 'POST' && (u.pathname === '/api/refund/initiate' || u.pathname === '/api/refund/initiate/' || u.pathname === '/refund/initiate')) {
-      return await handleRefundInitiate(req, res);
-    }
-
     if (req.method === 'GET' && (u.pathname === '/api/merchant-currency' || u.pathname === '/merchant-currency')) {
       return await handleMerchantCurrency(req, res);
     }
@@ -2454,6 +2150,10 @@ module.exports = async function handler(req, res) {
 
     if ((req.method === 'GET' || req.method === 'POST') && (u.pathname === '/return' || u.pathname === '/api/return')) {
       return await handleReturn(req, res);
+    }
+
+    if (req.method === 'GET' && (u.pathname === '/receipt.pdf' || u.pathname === '/api/receipt.pdf')) {
+      return await handleReceiptPdf(req, res);
     }
 
     if (req.method === 'GET' && (u.pathname.startsWith('/api/tx/') || u.pathname.startsWith('/tx/'))) {

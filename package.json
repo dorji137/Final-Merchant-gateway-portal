@@ -2,5 +2,12 @@
   "name": "cardzone-checkout",
   "version": "1.0.0",
   "private": true,
-  "type": "commonjs"
+  "type": "commonjs",
+  "dependencies": {
+    "pdfkit": "^0.15.2"
+  },
+  "scripts": {
+    "dev": "node local-dev-server.js",
+    "start": "node local-dev-server.js"
+  }
 }
