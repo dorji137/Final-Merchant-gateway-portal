@@ -341,7 +341,7 @@ Example Response Codes:
 ## Payment Link Feature
 
 ### Overview
-Merchants can generate shareable payment links that expire after a fixed time (default: 7 days).
+Merchants can generate shareable payment links that expire after a fixed time (default: 30 minutes).
 
 ### Flow
 
@@ -535,7 +535,7 @@ CALLBACK_BASE_URL=https://merchant.com
 
 # Storage
 MERCHANT_CURRENCY_DB_PATH=./data/merchant-currency.json
-PAYMENT_LINK_TTL_MS=604800000       # 7 days
+PAYMENT_LINK_TTL_MS=1800000         # 30 minutes
 
 # Server
 PORT=3000

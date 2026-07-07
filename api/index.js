@@ -19,7 +19,7 @@ const MERCHANT_CURRENCY_DB_PATH =
   process.env.MERCHANT_CURRENCY_DB_PATH || path.join(process.cwd(), 'data', 'merchant-currency.json');
 const ENABLE_MKREQ_MAC = process.env.ENABLE_MKREQ_MAC === 'true';
 const TEMP_DIR = process.env.VERCEL ? '/tmp' : path.join(os.tmpdir(), 'cardzone-backend');
-const PAYMENT_LINK_TTL_MS = Number(process.env.PAYMENT_LINK_TTL_MS || 7 * 24 * 60 * 60 * 1000);
+const PAYMENT_LINK_TTL_MS = Number(process.env.PAYMENT_LINK_TTL_MS || 30 * 60 * 1000);
 
 const txStore = new Map();
 
@@ -801,6 +801,7 @@ function renderMessagePage(title, message, details) {
 
 function renderResultPage(tx, paymentStatus, finalResult, homeUrl = '/') {
   const isSuccess = paymentStatus === 'SUCCESS';
+  const isPaymentLinkFlow = tx?.initiationSource === 'payment-link' || !!tx?.paymentLinkToken;
   const responseCode = finalResult?.responseCode || '';
   const responseReason = getResponseReasonFromCode(responseCode, finalResult?.responseReason || '');
 
@@ -884,6 +885,10 @@ function renderResultPage(tx, paymentStatus, finalResult, homeUrl = '/') {
     txDate,
     status:       paymentStatus,
   }).replace(/<\/script>/gi, '<\\/script>');
+
+  const homeButtonHtml = isPaymentLinkFlow
+    ? ''
+    : `<a class="btn btn-home" href="${escapeHtml(homeUrl)}">&#8592;&nbsp;Back to Home</a>`;
 
   return `<!doctype html><html lang="en">
 <head>
@@ -971,7 +976,7 @@ function renderResultPage(tx, paymentStatus, finalResult, homeUrl = '/') {
       <div class="actions">
         <button class="btn btn-dl" onclick="downloadReceiptPdf()">&#8659;&nbsp;Download PDF Receipt</button>
         <button class="btn btn-print" onclick="window.print()">&#128438;&nbsp;Print Receipt</button>
-        <a class="btn btn-home" href="${escapeHtml(homeUrl)}">&#8592;&nbsp;Back to Home</a>
+        ${homeButtonHtml}
       </div>
       <div class="ftr">
         This is an official electronic receipt issued by the Secure Payment Gateway.<br>
@@ -1586,6 +1591,8 @@ async function handleInitiate(req, res) {
   const customerName = String(input.customerName || '').trim();
   const email = String(input.email || '').trim();
   const mobilePhone = String(input.mobilePhone || '').trim();
+  const paymentLinkToken = String(input.paymentLinkToken || '').trim();
+  const initiationSource = paymentLinkToken ? 'payment-link' : 'direct';
   const successReturnUrl = String(input.successReturnUrl || '').trim();
   const failReturnUrl = String(input.failReturnUrl || '').trim();
   const txnId = String(input.txnId || generateTxnId()).trim();
@@ -1702,6 +1709,8 @@ async function handleInitiate(req, res) {
     amountMinor,
     amountMajor: amount,
     currency,
+    initiationSource,
+    paymentLinkToken: paymentLinkToken || null,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     successReturnUrl,
@@ -2078,6 +2087,7 @@ async function handlePaymentLinkLanding(req, res, token) {
       customerName: paymentLink.customerName,
       email: paymentLink.email,
       mobilePhone: paymentLink.mobilePhone,
+      paymentLinkToken: paymentLink.token || token,
     })
   );
 }
