@@ -1,8 +1,5 @@
 const crypto = require('crypto');
 const { URL } = require('url');
-const fs = require('fs').promises;
-const path = require('path');
-const os = require('os');
 const PDFDocument = require('pdfkit');
 const { MongoClient } = require('mongodb');
 
@@ -19,7 +16,6 @@ const CARDZONE_PROFILE_URL = process.env.CARDZONE_PROFILE_URL || '';
 const MONGODB_URI = process.env.MONGODB_URI || '';
 const MONGODB_DB_NAME = process.env.MONGODB_DB_NAME || 'nanodb';
 const ENABLE_MKREQ_MAC = process.env.ENABLE_MKREQ_MAC === 'true';
-const TEMP_DIR = process.env.VERCEL ? '/tmp' : path.join(os.tmpdir(), 'cardzone-backend');
 const PAYMENT_LINK_TTL_MS = Number(process.env.PAYMENT_LINK_TTL_MS || 30 * 60 * 1000);
 const INVOICE_DEFAULT_DUE_MS = Number(process.env.INVOICE_DEFAULT_DUE_MS || 7 * 24 * 60 * 60 * 1000);
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
@@ -1045,15 +1041,22 @@ function mapTransactionLifecycleStatus({ callbackReceived, finalResult }) {
   return mapFinalPaymentStatus(finalResult);
 }
 
-function txFilePath(txnId) {
-  const safeId = String(txnId || '').replace(/[^a-zA-Z0-9_-]/g, '');
-  return path.join(TEMP_DIR, `txn_${safeId}.json`);
+let pendingTxIndexEnsured = false;
+function ensurePendingTxIndex(db) {
+  if (pendingTxIndexEnsured) return;
+  pendingTxIndexEnsured = true;
+  db.collection('pendingTransactions').createIndex({ createdAtDate: 1 }, { expireAfterSeconds: 30 * 24 * 60 * 60 }).catch(() => {});
 }
 
 async function saveTransaction(tx) {
   txStore.set(tx.txnId, tx);
-  await fs.mkdir(TEMP_DIR, { recursive: true });
-  await fs.writeFile(txFilePath(tx.txnId), JSON.stringify(tx, null, 2), 'utf8');
+  const db = await getMongoDb();
+  ensurePendingTxIndex(db);
+  await db.collection('pendingTransactions').replaceOne(
+    { _id: tx.txnId },
+    { _id: tx.txnId, ...tx, createdAtDate: tx.createdAt ? new Date(tx.createdAt) : new Date() },
+    { upsert: true }
+  );
 }
 
 async function getTransaction(txnId) {
@@ -1063,14 +1066,12 @@ async function getTransaction(txnId) {
   const inMemory = txStore.get(id);
   if (inMemory) return inMemory;
 
-  try {
-    const content = await fs.readFile(txFilePath(id), 'utf8');
-    const tx = JSON.parse(content);
-    txStore.set(id, tx);
-    return tx;
-  } catch {
-    return null;
-  }
+  const db = await getMongoDb();
+  const doc = await db.collection('pendingTransactions').findOne({ _id: id });
+  if (!doc) return null;
+  const { _id, createdAtDate, ...tx } = doc;
+  txStore.set(id, tx);
+  return tx;
 }
 
 let paymentLinksIndexEnsured = false;
