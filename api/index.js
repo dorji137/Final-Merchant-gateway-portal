@@ -1925,9 +1925,10 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
     *{box-sizing:border-box}
     body{margin:0;font-family:Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--text)}
     .app{display:grid;grid-template-columns:270px 1fr;min-height:100vh}
-    .sidebar{background:#ffffff;border-right:1px solid var(--line);color:#475569;padding:20px 14px;overflow:auto;display:flex;flex-direction:column}
+    .sidebar{background:#f1f5f9;border-right:1px solid var(--line);color:#475569;padding:20px 14px;overflow:auto;display:flex;flex-direction:column}
     .brand{display:flex;align-items:center;gap:10px;margin:2px 6px 20px}
-    .brand-icon{width:38px;height:38px;border-radius:10px;background:#0f172a;color:#fff;display:flex;align-items:center;justify-content:center;flex-shrink:0;overflow:hidden}
+    .brand-icon{width:56px;height:56px;border-radius:10px;background:transparent;color:#fff;display:flex;align-items:center;justify-content:center;flex-shrink:0;overflow:hidden}
+    .brand-icon.icon-fallback{background:#0f172a}
     .brand-icon img{width:100%;height:100%;object-fit:contain}
     .brand-name{font-weight:800;font-size:14.5px;color:#0f172a;line-height:1.25;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:170px}
     .brand-sub{font-size:10.5px;color:#94a3b8;letter-spacing:.5px;text-transform:uppercase}
@@ -1936,7 +1937,7 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
     .menu-head,.menu-item{width:100%;display:flex;align-items:center;gap:10px;text-align:left;border:0;background:transparent;color:#475569;padding:9px 10px;border-radius:9px;cursor:pointer;font-size:13.5px;font-weight:600}
     .menu-head{font-weight:700}
     .menu-head svg,.menu-item svg{flex-shrink:0}
-    .menu-head:hover,.menu-item:hover{background:#f1f5f9}
+    .menu-head:hover,.menu-item:hover{background:#e2e8f0}
     .menu-item.active,.menu-head.active{background:linear-gradient(90deg,var(--brand1),var(--brand2));color:#fff}
     .submenu{display:grid;gap:3px;margin-top:2px}
     .sidebar-spacer{flex:1}
@@ -2039,9 +2040,6 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
     .chart-select{border:1px solid var(--line);border-radius:8px;padding:7px 10px;font-size:12.5px;font-weight:600;color:#334155;background:#fff}
     .chart-legend{display:flex;gap:16px;margin-top:8px;font-size:12px;color:#475569;flex-wrap:wrap}
     .chart-legend-dot{display:inline-block;width:8px;height:8px;border-radius:999px;margin-right:6px}
-    .mini-chart-block{margin-bottom:14px}
-    .mini-chart-block:last-child{margin-bottom:0}
-    .mini-chart-label{font-size:12px;font-weight:700;color:#334155;margin-bottom:4px}
 
     .table-head-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 14px;border-bottom:1px solid var(--line)}
     .table-head-row h3{padding:0;border:0;margin:0}
@@ -2052,19 +2050,34 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
     .page-btn:disabled{opacity:.4;cursor:not-allowed}
     .row-icon-buttons{display:flex;gap:4px;align-items:center}
 
+    .mobile-topbar{display:none}
+    .menu-toggle-btn{border:1px solid var(--line);background:#fff;border-radius:8px;width:38px;height:38px;display:flex;align-items:center;justify-content:center;cursor:pointer;color:#475569}
+    .sidebar-backdrop{display:none}
+
     @media (max-width:1080px){
       .app{grid-template-columns:1fr}
-      .sidebar{position:sticky;top:0;max-height:42vh;z-index:2}
+      .mobile-topbar{display:flex;align-items:center;padding:12px 16px;background:#fff;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:15}
+      .sidebar{
+        position:fixed;top:0;left:0;height:100vh;width:270px;max-width:80vw;z-index:25;
+        transform:translateX(-100%);transition:transform .2s ease;box-shadow:0 20px 40px rgba(15,23,42,.25);
+      }
+      .sidebar.open{transform:translateX(0)}
+      .sidebar-backdrop{display:none;position:fixed;inset:0;background:rgba(15,23,42,.4);z-index:20}
+      .sidebar-backdrop.open{display:block}
       .col-6,.col-4,.col-3,.col-8{grid-column:span 12}
       .kv{grid-template-columns:1fr}
     }
   </style>
 </head>
 <body>
+  <div class="mobile-topbar">
+    <button class="menu-toggle-btn" id="menuToggleBtn" type="button" aria-label="Open menu">${icon('grid', 18)}</button>
+  </div>
+  <div class="sidebar-backdrop" id="sidebarBackdrop"></div>
   <div class="app">
     <aside class="sidebar">
       <div class="brand">
-        <div class="brand-icon" id="sidebarBrandIcon">${icon('store', 20)}</div>
+        <div class="brand-icon icon-fallback" id="sidebarBrandIcon">${icon('store', 28)}</div>
         <div>
           <div class="brand-name" id="sidebarBrandName">Merchant Portal</div>
           <div class="brand-sub">Payment Gateway</div>
@@ -2137,7 +2150,6 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
               <div id="bellPanelBody"><div class="bell-empty">Loading...</div></div>
             </div>
           </div>
-          <button class="btn primary" id="topbarLogoutBtn">Logout</button>
         </div>
       </div>
 
@@ -2163,12 +2175,12 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
 
         <article class="card" style="margin-top:14px">
           <div class="chart-head">
-            <h3 style="border:0;padding:0">Revenue Chart</h3>
+            <h3 style="border:0;padding:0">Success &amp; Failure Rate</h3>
             <div class="chart-filters">
               <select class="chart-select" id="chartCurrencyFilter"><option value="all">All Currencies</option></select>
             </div>
           </div>
-          <div class="card-body"><div id="revenueChart"></div><div class="chart-legend" id="chartLegend"></div></div>
+          <div class="card-body"><div id="rateChart"></div><div class="chart-legend" id="chartLegend"></div></div>
         </article>
 
         <article class="card" style="margin-top:14px">
@@ -2452,10 +2464,13 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
         const period = hour < 12 ? 'Morning' : (hour < 18 ? 'Afternoon' : 'Evening');
         document.getElementById('dashGreeting').innerHTML = '<span id="dashGreetingIcon">' + iconMountain + '</span> Good ' + period;
         document.getElementById('dashWelcome').textContent = 'Welcome, ' + merchantName;
+        const brandIconEl = document.getElementById('sidebarBrandIcon');
         if (logoUrl) {
-          document.getElementById('sidebarBrandIcon').innerHTML = '<img src="' + logoUrl + '" alt="Logo" />';
+          brandIconEl.innerHTML = '<img src="' + logoUrl + '" alt="Logo" />';
+          brandIconEl.classList.remove('icon-fallback');
         } else {
-          document.getElementById('sidebarBrandIcon').innerHTML = iconStore;
+          brandIconEl.innerHTML = iconStore;
+          brandIconEl.classList.add('icon-fallback');
         }
       }
       var iconMountain = document.getElementById('dashGreetingIcon').innerHTML;
@@ -2484,10 +2499,30 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
         if (sectionLoaders[id]) sectionLoaders[id]();
       }
 
+      const sidebarEl = document.querySelector('.sidebar');
+      const sidebarBackdrop = document.getElementById('sidebarBackdrop');
+      const menuToggleBtn = document.getElementById('menuToggleBtn');
+
+      function closeMobileSidebar() {
+        sidebarEl.classList.remove('open');
+        sidebarBackdrop.classList.remove('open');
+      }
+
+      if (menuToggleBtn) {
+        menuToggleBtn.addEventListener('click', function () {
+          sidebarEl.classList.add('open');
+          sidebarBackdrop.classList.add('open');
+        });
+      }
+      if (sidebarBackdrop) {
+        sidebarBackdrop.addEventListener('click', closeMobileSidebar);
+      }
+
       document.querySelectorAll('.nav-btn').forEach(function (btn) {
         btn.addEventListener('click', function () {
           const target = btn.getAttribute('data-target');
           if (target) activateSection(target);
+          closeMobileSidebar();
         });
       });
 
@@ -2505,7 +2540,18 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
       }
 
       document.getElementById('logoutBtn').addEventListener('click', performLogout);
-      document.getElementById('topbarLogoutBtn').addEventListener('click', performLogout);
+
+      const INACTIVITY_LIMIT_MS = 5 * 60 * 1000;
+      let lastActivityAt = Date.now();
+      function markActivity() { lastActivityAt = Date.now(); }
+      ['mousemove', 'mousedown', 'keydown', 'scroll', 'touchstart', 'click'].forEach(function (evt) {
+        document.addEventListener(evt, markActivity, { passive: true });
+      });
+      setInterval(function () {
+        if (Date.now() - lastActivityAt > INACTIVITY_LIMIT_MS) {
+          performLogout();
+        }
+      }, 15000);
 
       document.getElementById('editMerchantName').value = portal.merchantName || '';
       document.getElementById('editAddress').value = portal.address || '';
@@ -2866,7 +2912,6 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
 
       (function () {
         const dashCurrencyNames = { '840': 'USD', '356': 'INR', '064': 'BTN' };
-        const paletteOrder = ['#2a78d6', '#1baf7a', '#eda100', '#4a3aa7'];
         const rangeLabels = { '7': 'Last 7 Days', '30': 'Last 30 Days', '90': 'Last 90 Days', 'mtd': 'Month to Date', 'today': 'Today' };
         var currentPreset = '30';
         var lastSummaryData = null;
@@ -2892,35 +2937,40 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
           return { from: from, to: to };
         }
 
-        function buildLineChartSvg(series, color, currencyLabel, width, height) {
-          height = height || 140;
+        function buildRateChartSvg(series, width, height) {
+          height = height || 220;
           width = Math.max(width || 600, 220);
-          const padLeft = 8, padRight = 8, padTop = 10, padBottom = 20;
+          const padLeft = 8, padRight = 30, padTop = 10, padBottom = 20;
           const plotW = width - padLeft - padRight;
           const plotH = height - padTop - padBottom;
-          const maxVal = Math.max.apply(null, series.map(function (p) { return p.amount; }).concat([1]));
           const stepX = series.length > 1 ? plotW / (series.length - 1) : 0;
-          const points = series.map(function (p, i) {
-            const x = padLeft + i * stepX;
-            const y = padTop + plotH - (maxVal > 0 ? (p.amount / maxVal) * plotH : 0);
-            return { x: x, y: y, p: p };
-          });
-          const linePath = points.map(function (pt, i) {
-            return (i === 0 ? 'M' : 'L') + pt.x.toFixed(1) + ' ' + pt.y.toFixed(1);
-          }).join(' ');
-          const areaPath = linePath + ' L' + (padLeft + plotW).toFixed(1) + ' ' + (padTop + plotH) + ' L' + padLeft + ' ' + (padTop + plotH) + ' Z';
-          const gridLines = [0.25, 0.5, 0.75, 1].map(function (f) {
-            const y = padTop + plotH * (1 - f);
-            return '<line x1="' + padLeft + '" y1="' + y + '" x2="' + (width - padRight) + '" y2="' + y + '" stroke="#e5e7eb" stroke-width="1" />';
+          function yFor(pct) { return padTop + plotH - (pct / 100) * plotH; }
+
+          const successPoints = series.map(function (p, i) { return { x: padLeft + i * stepX, y: yFor(p.successRate), p: p }; });
+          const failurePoints = series.map(function (p, i) { return { x: padLeft + i * stepX, y: yFor(p.failureRate), p: p }; });
+
+          function pathFor(points) {
+            return points.map(function (pt, i) { return (i === 0 ? 'M' : 'L') + pt.x.toFixed(1) + ' ' + pt.y.toFixed(1); }).join(' ');
+          }
+
+          const gridLines = [0, 25, 50, 75, 100].map(function (pct) {
+            const y = yFor(pct);
+            return '<line x1="' + padLeft + '" y1="' + y + '" x2="' + (width - padRight) + '" y2="' + y + '" stroke="#e5e7eb" stroke-width="1" />' +
+              '<text x="' + (width - padRight + 4) + '" y="' + (y + 3) + '" font-size="9" fill="#94a3b8">' + pct + '%</text>';
           }).join('');
-          const dots = points.map(function (pt) {
-            return '<circle cx="' + pt.x.toFixed(1) + '" cy="' + pt.y.toFixed(1) + '" r="2.5" fill="' + color + '"><title>' + pt.p.date + ': ' + currencyLabel + ' ' + pt.p.amount.toFixed(2) + '</title></circle>';
+
+          const successDots = successPoints.map(function (pt) {
+            return '<circle cx="' + pt.x.toFixed(1) + '" cy="' + pt.y.toFixed(1) + '" r="2.5" fill="#16a34a"><title>' + pt.p.date + ': Success ' + pt.p.successRate + '%</title></circle>';
           }).join('');
-          return '<svg viewBox="0 0 ' + width + ' ' + height + '" style="width:100%;height:' + height + 'px" role="img" aria-label="' + currencyLabel + ' revenue">' +
+          const failureDots = failurePoints.map(function (pt) {
+            return '<circle cx="' + pt.x.toFixed(1) + '" cy="' + pt.y.toFixed(1) + '" r="2.5" fill="#dc2626"><title>' + pt.p.date + ': Failure ' + pt.p.failureRate + '%</title></circle>';
+          }).join('');
+
+          return '<svg viewBox="0 0 ' + width + ' ' + height + '" style="width:100%;height:' + height + 'px" role="img" aria-label="Success vs failure rate">' +
             gridLines +
-            '<path d="' + areaPath + '" fill="' + color + '" opacity="0.12" stroke="none" />' +
-            '<path d="' + linePath + '" fill="none" stroke="' + color + '" stroke-width="2" />' +
-            dots +
+            '<path d="' + pathFor(successPoints) + '" fill="none" stroke="#16a34a" stroke-width="2" />' +
+            '<path d="' + pathFor(failurePoints) + '" fill="none" stroke="#dc2626" stroke-width="2" stroke-dasharray="4 3" />' +
+            successDots + failureDots +
             '</svg>';
         }
 
@@ -2934,42 +2984,22 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
           select.value = (current === 'all' || currencies.indexOf(current) !== -1) ? current : 'all';
         }
 
-        function renderRevenueChart(seriesByCurrency, filterCurrency) {
-          const container = document.getElementById('revenueChart');
+        function renderRateChart(seriesByCurrency, filterCurrency) {
+          const container = document.getElementById('rateChart');
           const legend = document.getElementById('chartLegend');
           const width = Math.max(container.clientWidth || 600, 220);
-          const currencies = Object.keys(seriesByCurrency);
+          const key = (filterCurrency && filterCurrency !== 'all' && seriesByCurrency[filterCurrency]) ? filterCurrency : 'all';
+          const series = seriesByCurrency[key] || [];
 
-          if (!currencies.length) {
-            container.innerHTML = '<div class="muted" style="padding:20px 0;text-align:center">No paid invoices in this period.</div>';
+          if (!series.length) {
+            container.innerHTML = '<div class="muted" style="padding:20px 0;text-align:center">No payment activity in this period.</div>';
             legend.innerHTML = '';
             return;
           }
 
-          if (filterCurrency && filterCurrency !== 'all' && currencies.indexOf(filterCurrency) !== -1) {
-            const idx = currencies.indexOf(filterCurrency);
-            const label = dashCurrencyNames[filterCurrency] || filterCurrency;
-            const series = seriesByCurrency[filterCurrency] || [];
-            container.innerHTML = series.length
-              ? buildLineChartSvg(series, paletteOrder[idx % paletteOrder.length], label, width, 220)
-              : '<div class="muted" style="padding:20px 0;text-align:center">No data for ' + label + '.</div>';
-            legend.innerHTML = '<span><span class="chart-legend-dot" style="background:' + paletteOrder[idx % paletteOrder.length] + '"></span>' + label + '</span>';
-            return;
-          }
-
-          var html = '';
-          currencies.forEach(function (cur, i) {
-            const label = dashCurrencyNames[cur] || cur;
-            const color = paletteOrder[i % paletteOrder.length];
-            const series = seriesByCurrency[cur] || [];
-            html += '<div class="mini-chart-block"><div class="mini-chart-label">' + label + '</div>' +
-              (series.length ? buildLineChartSvg(series, color, label, width, 120) : '<div class="muted" style="padding:12px 0;text-align:center;font-size:12px">No data.</div>') +
-              '</div>';
-          });
-          container.innerHTML = html;
-          legend.innerHTML = currencies.map(function (cur, i) {
-            return '<span><span class="chart-legend-dot" style="background:' + paletteOrder[i % paletteOrder.length] + '"></span>' + (dashCurrencyNames[cur] || cur) + '</span>';
-          }).join('');
+          container.innerHTML = buildRateChartSvg(series, width, 220);
+          legend.innerHTML = '<span><span class="chart-legend-dot" style="background:#16a34a"></span>Success Rate</span>' +
+            '<span><span class="chart-legend-dot" style="background:#dc2626"></span>Failure Rate</span>';
         }
 
         function renderDelta(elId, pct, isPoints) {
@@ -3009,9 +3039,9 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
             document.getElementById('statSuccessRate').textContent = (data.successRate || 0) + '%';
             renderDelta('statSuccessRateDelta', data.successRateDeltaPct, true);
 
-            const seriesByCurrency = data.revenueSeriesByCurrency || {};
-            populateCurrencyFilter(Object.keys(seriesByCurrency));
-            renderRevenueChart(seriesByCurrency, document.getElementById('chartCurrencyFilter').value || 'all');
+            const rateSeriesByCurrency = data.successFailureSeriesByCurrency || {};
+            populateCurrencyFilter(Object.keys(rateSeriesByCurrency).filter(function (k) { return k !== 'all'; }));
+            renderRateChart(rateSeriesByCurrency, document.getElementById('chartCurrencyFilter').value || 'all');
 
             document.getElementById('pendingActionsBody').innerHTML = data.totalPendingCount
               ? '<p style="margin:0 0 10px">You have <strong>' + data.totalPendingCount + '</strong> invoice(s) awaiting payment.</p><button class="btn primary" type="button" data-quick-nav="invoices-all">View Pending Invoices</button>'
@@ -3032,7 +3062,7 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
         }
 
         document.getElementById('chartCurrencyFilter').addEventListener('change', function (event) {
-          if (lastSummaryData) renderRevenueChart(lastSummaryData.revenueSeriesByCurrency || {}, event.target.value);
+          if (lastSummaryData) renderRateChart(lastSummaryData.successFailureSeriesByCurrency || {}, event.target.value);
         });
 
         // Date range dropdown
@@ -4659,18 +4689,41 @@ async function handleDashboardSummary(req, res) {
     }
   }
 
-  const revenueSeriesByCurrency = {};
-  for (const cur of Object.keys(current.revenueByCurrency)) {
-    const dayTotals = {};
-    dayKeys.forEach(d => { dayTotals[d] = 0; });
-    for (const inv of currentInvoices) {
-      if (inv.status !== 'paid') continue;
-      const invCur = normalizeCurrency(inv.currency) || inv.currency;
-      if (invCur !== cur) continue;
-      const day = String(inv.invoiceDate || '').slice(0, 10);
-      if (day in dayTotals) dayTotals[day] += Number(inv.amount || 0);
+  const rateCurrencies = new Set();
+  for (const inv of currentInvoices) {
+    if (inv.status === 'paid' || inv.status === 'failed') {
+      rateCurrencies.add(normalizeCurrency(inv.currency) || inv.currency);
     }
-    revenueSeriesByCurrency[cur] = dayKeys.map(d => ({ date: d, amount: Math.round(dayTotals[d] * 100) / 100 }));
+  }
+
+  function computeRateSeries(filterCurrency) {
+    const dayPaid = {};
+    const dayFailed = {};
+    dayKeys.forEach(d => { dayPaid[d] = 0; dayFailed[d] = 0; });
+    for (const inv of currentInvoices) {
+      if (inv.status !== 'paid' && inv.status !== 'failed') continue;
+      const invCur = normalizeCurrency(inv.currency) || inv.currency;
+      if (filterCurrency !== 'all' && invCur !== filterCurrency) continue;
+      const day = String(inv.invoiceDate || '').slice(0, 10);
+      if (!(day in dayPaid)) continue;
+      if (inv.status === 'paid') dayPaid[day] += 1;
+      else dayFailed[day] += 1;
+    }
+    return dayKeys.map(d => {
+      const paidCount = dayPaid[d];
+      const failedCount = dayFailed[d];
+      const total = paidCount + failedCount;
+      return {
+        date: d,
+        successRate: total > 0 ? Math.round((paidCount / total) * 1000) / 10 : 0,
+        failureRate: total > 0 ? Math.round((failedCount / total) * 1000) / 10 : 0,
+      };
+    });
+  }
+
+  const successFailureSeriesByCurrency = { all: computeRateSeries('all') };
+  for (const cur of rateCurrencies) {
+    successFailureSeriesByCurrency[cur] = computeRateSeries(cur);
   }
 
   const totalPendingCount = allInvoices.filter(i => i.status === 'pending').length;
@@ -4688,7 +4741,7 @@ async function handleDashboardSummary(req, res) {
     pendingPctOfTotal,
     successRate: current.successRate,
     successRateDeltaPct,
-    revenueSeriesByCurrency,
+    successFailureSeriesByCurrency,
     totalPendingCount,
   });
 }
