@@ -26,7 +26,6 @@ const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 12 * 60 * 60 * 1000);
 
 const txStore = new Map();
-const sessionStore = new Map();
 
 let mongoClientPromise = null;
 
@@ -182,6 +181,33 @@ function escapeHtml(s = '') {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+const ICONS = {
+  grid: '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
+  'plus-square': '<rect x="3" y="3" width="18" height="18" rx="3"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/>',
+  document: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="16" y2="17"/>',
+  'credit-card': '<rect x="2" y="5" width="20" height="14" rx="2"/><line x1="2" y1="10" x2="22" y2="10"/>',
+  user: '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
+  lock: '<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+  store: '<path d="M3 9l1.5-5h15L21 9"/><path d="M3 9v10a1 1 0 0 0 1 1h16a1 1 0 0 0 1-1V9"/><path d="M9 20v-6h6v6"/>',
+  bell: '<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/>',
+  calendar: '<rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>',
+  eye: '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>',
+  copy: '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+  wallet: '<path d="M21 12V7a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-5"/><path d="M17 12a2 2 0 1 0 0 4h4v-4z"/>',
+  'check-circle': '<circle cx="12" cy="12" r="10"/><polyline points="8 12 11 15 16 9"/>',
+  clock: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
+  'trending-up': '<polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/>',
+  'trending-down': '<polyline points="23 18 13.5 8.5 8.5 13.5 1 6"/><polyline points="17 18 23 18 23 12"/>',
+  chevron: '<polyline points="6 9 12 15 18 9"/>',
+  logout: '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>',
+  mountain: '<path d="M3 20l6-11 4 6 3-4 5 9z"/>',
+  shield: '<path d="M12 22s8-4 8-11V5l-8-3-8 3v6c0 7 8 11 8 11z"/>',
+};
+
+function icon(name, size = 18) {
+  return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICONS[name] || ''}</svg>`;
 }
 
 function parseBody(req) {
@@ -355,23 +381,44 @@ function getSessionTokenFromRequest(req) {
   return String(cookies.portalSession || '').trim();
 }
 
-function cleanupExpiredSessions() {
-  const now = Date.now();
-  for (const [token, session] of sessionStore.entries()) {
-    if (!session?.expiresAt || Date.parse(session.expiresAt) <= now) {
-      sessionStore.delete(token);
-    }
-  }
+let sessionsIndexEnsured = false;
+function ensureSessionsIndex(db) {
+  if (sessionsIndexEnsured) return;
+  sessionsIndexEnsured = true;
+  db.collection('sessions').createIndex({ expiresAtDate: 1 }, { expireAfterSeconds: 0 }).catch(() => {});
 }
 
-function getAuthenticatedSession(req) {
-  cleanupExpiredSessions();
+async function getSessionRecord(token) {
+  const db = await getMongoDb();
+  ensureSessionsIndex(db);
+  const doc = await db.collection('sessions').findOne({ _id: token });
+  if (!doc) return null;
+  const { _id, expiresAtDate, ...session } = doc;
+  return session;
+}
+
+async function saveSessionRecord(token, session) {
+  const db = await getMongoDb();
+  ensureSessionsIndex(db);
+  await db.collection('sessions').replaceOne(
+    { _id: token },
+    { _id: token, ...session, expiresAtDate: new Date(session.expiresAt) },
+    { upsert: true }
+  );
+}
+
+async function deleteSessionRecord(token) {
+  const db = await getMongoDb();
+  await db.collection('sessions').deleteOne({ _id: token });
+}
+
+async function getAuthenticatedSession(req) {
   const token = getSessionTokenFromRequest(req);
   if (!token) return null;
-  const session = sessionStore.get(token);
+  const session = await getSessionRecord(token);
   if (!session) return null;
   if (!session.expiresAt || Date.parse(session.expiresAt) <= Date.now()) {
-    sessionStore.delete(token);
+    await deleteSessionRecord(token);
     return null;
   }
   return session;
@@ -1517,6 +1564,40 @@ async function resolveLogoBuffer(logoUrl) {
   return null;
 }
 
+function drawKvTablePdf(doc, rows, startX, startY, totalWidth, labelWidth) {
+  const cellPaddingX = 8;
+  const cellPaddingY = 6;
+  const valueWidth = totalWidth - labelWidth;
+  let y = startY;
+  const rowTops = [y];
+
+  for (const [label, value] of rows) {
+    const labelHeight = doc.heightOfString(String(label), { width: labelWidth - cellPaddingX * 2 });
+    const valueHeight = doc.heightOfString(String(value || '—'), { width: valueWidth - cellPaddingX * 2 });
+    const rowHeight = Math.max(labelHeight, valueHeight) + cellPaddingY * 2;
+
+    doc.fillColor('#f8fafc').rect(startX, y, labelWidth, rowHeight).fill();
+    doc.fillColor('#64748b').font('Helvetica-Bold').fontSize(10)
+      .text(String(label), startX + cellPaddingX, y + cellPaddingY, { width: labelWidth - cellPaddingX * 2 });
+    doc.fillColor('#111827').font('Helvetica').fontSize(10)
+      .text(String(value || '—'), startX + labelWidth + cellPaddingX, y + cellPaddingY, { width: valueWidth - cellPaddingX * 2 });
+
+    y += rowHeight;
+    rowTops.push(y);
+  }
+
+  const tableBottom = y;
+  doc.strokeColor('#cbd5e1').lineWidth(1).rect(startX, startY, totalWidth, tableBottom - startY).stroke();
+  doc.moveTo(startX + labelWidth, startY).lineTo(startX + labelWidth, tableBottom).strokeColor('#cbd5e1').lineWidth(1).stroke();
+  for (let i = 1; i < rowTops.length - 1; i++) {
+    doc.moveTo(startX, rowTops[i]).lineTo(startX + totalWidth, rowTops[i]).strokeColor('#e2e8f0').lineWidth(0.75).stroke();
+  }
+
+  doc.x = startX;
+  doc.y = tableBottom;
+  return tableBottom;
+}
+
 async function generateInvoicePdfBuffer(invoice, merchantProfile = null) {
   const CURRENCY_NAMES = {
     '840': 'USD', '356': 'INR', '064': 'BTN', '524': 'NPR', '144': 'LKR',
@@ -1552,6 +1633,10 @@ async function generateInvoicePdfBuffer(invoice, merchantProfile = null) {
     doc.on('data', c => chunks.push(c));
     doc.on('end', () => resolve(Buffer.concat(chunks)));
     doc.on('error', reject);
+    const drawPageBorder = () => doc.strokeColor('#cbd5e1').lineWidth(1)
+      .rect(20, 20, doc.page.width - 40, doc.page.height - 40).stroke();
+    doc.on('pageAdded', drawPageBorder);
+    drawPageBorder();
 
     let logoRendered = false;
     if (logoBuffer) {
@@ -1572,18 +1657,7 @@ async function generateInvoicePdfBuffer(invoice, merchantProfile = null) {
     doc.fillColor('#64748b').font('Helvetica').fontSize(10).text('Payment Invoice');
     doc.moveDown(1.2);
 
-    const startX = doc.x;
-    let y = doc.y;
-    const labelWidth = 190;
-    const valueX = startX + labelWidth;
-    const rowGap = 8;
-
-    for (const [label, value] of rows) {
-      doc.fillColor('#64748b').font('Helvetica-Bold').fontSize(10).text(label, startX, y, { width: labelWidth - 10 });
-      doc.fillColor('#111827').font('Helvetica').fontSize(10).text(String(value || '—'), valueX, y, { width: 320 });
-      y = Math.max(doc.y, y) + rowGap;
-      doc.moveTo(startX, y - 4).lineTo(545, y - 4).strokeColor('#e5e7eb').lineWidth(0.5).stroke();
-    }
+    drawKvTablePdf(doc, rows, doc.x, doc.y, 495, 190);
 
     if (invoice.customerMessage) {
       doc.moveDown(1);
@@ -1647,6 +1721,10 @@ async function generateTransactionReceiptPdfBuffer(tx, merchantProfile = null) {
     doc.on('data', c => chunks.push(c));
     doc.on('end', () => resolve(Buffer.concat(chunks)));
     doc.on('error', reject);
+    const drawPageBorder = () => doc.strokeColor('#cbd5e1').lineWidth(1)
+      .rect(20, 20, doc.page.width - 40, doc.page.height - 40).stroke();
+    doc.on('pageAdded', drawPageBorder);
+    drawPageBorder();
 
     let logoRendered = false;
     if (logoBuffer) {
@@ -1667,18 +1745,7 @@ async function generateTransactionReceiptPdfBuffer(tx, merchantProfile = null) {
     doc.fillColor('#64748b').font('Helvetica').fontSize(10).text('Receipt');
     doc.moveDown(1.2);
 
-    const startX = doc.x;
-    let y = doc.y;
-    const labelWidth = 190;
-    const valueX = startX + labelWidth;
-    const rowGap = 8;
-
-    for (const [label, value] of rows) {
-      doc.fillColor('#64748b').font('Helvetica-Bold').fontSize(10).text(label, startX, y, { width: labelWidth - 10 });
-      doc.fillColor('#111827').font('Helvetica').fontSize(10).text(String(value || '—'), valueX, y, { width: 320 });
-      y = Math.max(doc.y, y) + rowGap;
-      doc.moveTo(startX, y - 4).lineTo(545, y - 4).strokeColor('#e5e7eb').lineWidth(0.5).stroke();
-    }
+    drawKvTablePdf(doc, rows, doc.x, doc.y, 495, 190);
 
     doc.moveDown(1.2);
     doc.fillColor('#94a3b8').font('Helvetica').fontSize(9)
@@ -1854,26 +1921,60 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Merchant Portal</title>
   <style>
-    :root{--sidebar:#111827;--sidebar2:#1f2937;--text:#0f172a;--muted:#64748b;--bg:#f8fafc;--card:#ffffff;--line:#e2e8f0;--accent:#2563eb}
+    :root{--sidebar:#111827;--sidebar2:#1f2937;--text:#0f172a;--muted:#64748b;--bg:#f5f6fa;--card:#ffffff;--line:#e5e7eb;--accent:#2563eb;--brand1:#4f46e5;--brand2:#7c3aed}
     *{box-sizing:border-box}
     body{margin:0;font-family:Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--text)}
-    .app{display:grid;grid-template-columns:290px 1fr;min-height:100vh}
-    .sidebar{background:linear-gradient(180deg,var(--sidebar),var(--sidebar2));color:#e5e7eb;padding:18px 14px;overflow:auto}
-    .brand{font-weight:800;font-size:17px;letter-spacing:.2px;margin:2px 8px 16px}
-    .menu-group{margin:8px 0}
-    .menu-head,.menu-item{width:100%;text-align:left;border:0;background:transparent;color:#dbe2ee;padding:9px 10px;border-radius:8px;cursor:pointer;font-size:13.5px}
-    .menu-head{font-weight:700;color:#fff}
-    .menu-item{padding-left:22px;color:#c9d4e6}
-    .menu-head:hover,.menu-item:hover,.menu-item.active{background:rgba(255,255,255,.08)}
-    .submenu{display:grid;gap:4px;margin-top:4px}
+    .app{display:grid;grid-template-columns:270px 1fr;min-height:100vh}
+    .sidebar{background:#ffffff;border-right:1px solid var(--line);color:#475569;padding:20px 14px;overflow:auto;display:flex;flex-direction:column}
+    .brand{display:flex;align-items:center;gap:10px;margin:2px 6px 20px}
+    .brand-icon{width:38px;height:38px;border-radius:10px;background:#0f172a;color:#fff;display:flex;align-items:center;justify-content:center;flex-shrink:0;overflow:hidden}
+    .brand-icon img{width:100%;height:100%;object-fit:contain}
+    .brand-name{font-weight:800;font-size:14.5px;color:#0f172a;line-height:1.25;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:170px}
+    .brand-sub{font-size:10.5px;color:#94a3b8;letter-spacing:.5px;text-transform:uppercase}
+    .menu-group{margin:14px 0 4px}
+    .menu-group-label{font-size:10.5px;font-weight:800;color:#94a3b8;letter-spacing:.6px;text-transform:uppercase;padding:0 10px;margin-bottom:6px}
+    .menu-head,.menu-item{width:100%;display:flex;align-items:center;gap:10px;text-align:left;border:0;background:transparent;color:#475569;padding:9px 10px;border-radius:9px;cursor:pointer;font-size:13.5px;font-weight:600}
+    .menu-head{font-weight:700}
+    .menu-head svg,.menu-item svg{flex-shrink:0}
+    .menu-head:hover,.menu-item:hover{background:#f1f5f9}
+    .menu-item.active,.menu-head.active{background:linear-gradient(90deg,var(--brand1),var(--brand2));color:#fff}
+    .submenu{display:grid;gap:3px;margin-top:2px}
+    .sidebar-spacer{flex:1}
+    .sidebar-footer{margin-top:16px;padding:14px;border-radius:12px;background:#f8fafc;border:1px solid var(--line)}
+    .sidebar-footer-name{font-weight:800;font-size:13px;color:#0f172a;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .sidebar-footer-sub{font-size:11px;color:#94a3b8;margin-top:2px}
+    .sidebar-footer-mid{font-size:11px;color:#64748b;margin-top:8px;line-height:1.5}
+    .sidebar-logout{display:flex;align-items:center;gap:8px;margin-top:12px;color:#dc2626;font-weight:700;font-size:12.5px;border:0;background:transparent;cursor:pointer;padding:0}
 
-    .content{padding:22px 22px 26px}
-    .topbar{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:16px}
-    .title{margin:0;font-size:24px}
+    .content{padding:22px 26px 26px}
+    .topbar{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap;margin-bottom:18px}
+    .greeting{display:flex;align-items:center;gap:6px;font-size:13px;color:#64748b;font-weight:600}
+    .title{margin:2px 0 0;font-size:25px;font-weight:800;color:#0f172a}
     .subtitle{margin:4px 0 0;color:var(--muted);font-size:13px}
-    .actions{display:flex;gap:8px;flex-wrap:wrap}
+    .actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-left:auto}
     .btn{border:1px solid var(--line);background:#fff;color:#1f2f49;border-radius:8px;padding:9px 12px;font-size:12.5px;font-weight:700;cursor:pointer}
     .btn.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+    .icon-btn{display:flex;align-items:center;justify-content:center;position:relative;border:1px solid var(--line);background:#fff;border-radius:10px;width:38px;height:38px;cursor:pointer;color:#475569}
+    .icon-btn:hover{background:#f8fafc}
+    .badge-dot{position:absolute;top:-5px;right:-5px;background:#ef4444;color:#fff;font-size:10px;font-weight:800;border-radius:999px;min-width:16px;height:16px;display:flex;align-items:center;justify-content:center;padding:0 3px;line-height:1}
+    .dropdown-wrap{position:relative}
+    .dropdown-panel{position:absolute;right:0;top:calc(100% + 8px);background:#fff;border:1px solid var(--line);border-radius:12px;box-shadow:0 16px 40px rgba(15,23,42,.14);z-index:30;display:none;max-width:calc(100vw - 24px)}
+    .dropdown-panel.open{display:block}
+    .date-range-btn{display:flex;align-items:center;gap:8px;border:1px solid var(--line);background:#fff;border-radius:10px;padding:9px 14px;font-size:12.5px;font-weight:700;color:#334155;cursor:pointer}
+    .date-range-panel{min-width:200px;padding:6px}
+    .date-range-option{display:block;width:100%;text-align:left;border:0;background:transparent;padding:8px 10px;border-radius:8px;font-size:13px;color:#334155;cursor:pointer;font-weight:600}
+    .date-range-option:hover{background:#f1f5f9}
+    .date-range-option.active{color:var(--brand1);background:#f1f5f9}
+    .bell-panel{width:300px;max-height:340px;overflow:auto}
+    .bell-panel-head{padding:12px 14px;border-bottom:1px solid var(--line);font-weight:800;font-size:13px;color:#0f172a}
+    .bell-item{display:flex;gap:8px;padding:10px 14px;border-bottom:1px solid #f1f5f9;font-size:12.5px;color:#334155}
+    .bell-item:last-child{border-bottom:0}
+    .bell-item.unread{background:#f8fafc;font-weight:700}
+    .bell-item .dot{width:7px;height:7px;border-radius:999px;margin-top:5px;flex-shrink:0}
+    .bell-item .dot.overdue{background:#dc2626}
+    .bell-item .dot.due-soon{background:#f59e0b}
+    .bell-item .dot.failed{background:#dc2626}
+    .bell-empty{padding:18px 14px;text-align:center;color:#94a3b8;font-size:12.5px}
 
     .section{display:none}
     .section.active{display:block}
@@ -1916,11 +2017,40 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
 
     .dash-header{display:flex;align-items:center;gap:14px}
     .dash-header .logo{max-height:52px;max-width:180px;object-fit:contain}
-    .stat-tile{padding:2px}
-    .stat-label{font-size:11.5px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.4px}
-    .stat-value{font-size:24px;font-weight:800;margin-top:6px;color:#0f172a}
+
+    .stat-card{display:flex;align-items:flex-start;gap:12px;padding:2px}
+    .stat-icon{width:44px;height:44px;border-radius:12px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+    .stat-icon.blue{background:#dbeafe;color:#2563eb}
+    .stat-icon.green{background:#dcfce7;color:#16a34a}
+    .stat-icon.orange{background:#ffedd5;color:#ea580c}
+    .stat-icon.violet{background:#ede9fe;color:#7c3aed}
+    .stat-label{font-size:12px;color:#64748b;font-weight:700}
+    .stat-value{font-size:21px;font-weight:800;margin-top:3px;color:#0f172a;line-height:1.2}
     .stat-value.good{color:#16a34a}
     .stat-value.warn{color:#f59e0b}
+    .stat-sub{font-size:11.5px;color:#64748b;margin-top:3px}
+    .stat-delta{font-size:11.5px;font-weight:700;margin-top:7px;display:flex;align-items:center;gap:4px}
+    .stat-delta.up{color:#16a34a}
+    .stat-delta.down{color:#dc2626}
+    .stat-delta.flat{color:#94a3b8}
+
+    .chart-head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding:12px 14px;border-bottom:1px solid var(--line)}
+    .chart-filters{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    .chart-select{border:1px solid var(--line);border-radius:8px;padding:7px 10px;font-size:12.5px;font-weight:600;color:#334155;background:#fff}
+    .chart-legend{display:flex;gap:16px;margin-top:8px;font-size:12px;color:#475569;flex-wrap:wrap}
+    .chart-legend-dot{display:inline-block;width:8px;height:8px;border-radius:999px;margin-right:6px}
+    .mini-chart-block{margin-bottom:14px}
+    .mini-chart-block:last-child{margin-bottom:0}
+    .mini-chart-label{font-size:12px;font-weight:700;color:#334155;margin-bottom:4px}
+
+    .table-head-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 14px;border-bottom:1px solid var(--line)}
+    .table-head-row h3{padding:0;border:0;margin:0}
+    .link-btn{border:0;background:transparent;color:var(--accent);font-weight:700;font-size:12.5px;cursor:pointer;padding:0}
+    .pagination{display:flex;align-items:center;gap:6px;justify-content:flex-end;padding:10px 14px}
+    .page-btn{border:1px solid var(--line);background:#fff;border-radius:8px;min-width:28px;height:28px;font-size:12px;font-weight:700;color:#475569;cursor:pointer}
+    .page-btn.active{background:var(--brand1);border-color:var(--brand1);color:#fff}
+    .page-btn:disabled{opacity:.4;cursor:not-allowed}
+    .row-icon-buttons{display:flex;gap:4px;align-items:center}
 
     @media (max-width:1080px){
       .app{grid-template-columns:1fr}
@@ -1933,74 +2063,126 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
 <body>
   <div class="app">
     <aside class="sidebar">
-      <div class="brand">Merchant Portal</div>
-
-      <div class="menu-group">
-        <button class="menu-head nav-btn" data-target="dashboard">User Dashboard</button>
+      <div class="brand">
+        <div class="brand-icon" id="sidebarBrandIcon">${icon('store', 20)}</div>
+        <div>
+          <div class="brand-name" id="sidebarBrandName">Merchant Portal</div>
+          <div class="brand-sub">Payment Gateway</div>
+        </div>
       </div>
 
       <div class="menu-group">
-        <button class="menu-head">Invoices</button>
+        <button class="menu-head nav-btn" data-target="dashboard">${icon('grid', 17)} Dashboard</button>
+      </div>
+
+      <div class="menu-group">
+        <div class="menu-group-label">Invoices</div>
         <div class="submenu">
-          <button class="menu-item nav-btn" data-target="invoices-create">Create Invoice</button>
-          <button class="menu-item nav-btn" data-target="invoices-all">View All Invoices</button>
-          <button class="menu-item nav-btn" data-target="invoices-payments">View My Payments</button>
+          <button class="menu-item nav-btn" data-target="invoices-create">${icon('plus-square', 17)} Create Invoice</button>
+          <button class="menu-item nav-btn" data-target="invoices-all">${icon('document', 17)} View All Invoices</button>
+          <button class="menu-item nav-btn" data-target="invoices-payments">${icon('credit-card', 17)} View My Payments</button>
         </div>
       </div>
 
       ${sessionView?.role === 'developer' ? `
       <div class="menu-group">
-        <button class="menu-head">Developer Tools</button>
+        <div class="menu-group-label">Developer Tools</div>
         <div class="submenu">
-          <button class="menu-item nav-btn" data-target="developer-add-merchant">Add New Merchant</button>
-          <button class="menu-item nav-btn" data-target="developer-merchants-list">All Merchants</button>
+          <button class="menu-item nav-btn" data-target="developer-add-merchant">${icon('plus-square', 17)} Add New Merchant</button>
+          <button class="menu-item nav-btn" data-target="developer-merchants-list">${icon('document', 17)} All Merchants</button>
         </div>
       </div>
       ` : ''}
 
       <div class="menu-group">
-        <button class="menu-head">My Account</button>
+        <div class="menu-group-label">Account</div>
         <div class="submenu">
-          <button class="menu-item nav-btn" data-target="merchant-profile">Merchant Profile</button>
-          <button class="menu-item nav-btn" data-target="account-password">Change Password</button>
-          <button class="menu-item nav-btn" data-target="account-edit">Edit Username</button>
-          <button class="menu-item" id="logoutBtn">Logout</button>
+          <button class="menu-item nav-btn" data-target="merchant-profile">${icon('user', 17)} Merchant Profile</button>
+          <button class="menu-item nav-btn" data-target="account-password">${icon('lock', 17)} Change Password</button>
+          <button class="menu-item nav-btn" data-target="account-edit">${icon('user', 17)} Edit Username</button>
         </div>
+      </div>
+
+      <div class="sidebar-spacer"></div>
+
+      <div class="sidebar-footer">
+        <div class="sidebar-footer-name" id="sidebarFooterName">Merchant</div>
+        <div class="sidebar-footer-sub">${escapeHtml(sessionView?.username || '')}</div>
+        <div class="sidebar-footer-mid" id="sidebarFooterMid"></div>
+        <button class="sidebar-logout" id="logoutBtn">${icon('logout', 15)} Logout</button>
       </div>
     </aside>
 
     <main class="content">
       <div class="topbar">
-        <div class="dash-header">
-          <img id="dashLogo" class="logo" alt="Merchant Logo" style="display:none" />
-          <h1 class="title" id="dashWelcome" style="margin:0"></h1>
+        <div>
+          <div class="greeting" id="dashGreeting"><span id="dashGreetingIcon">${icon('mountain', 15)}</span> Good day</div>
+          <h1 class="title" id="dashWelcome">Welcome</h1>
         </div>
         <div class="actions">
+          <div class="dropdown-wrap">
+            <button class="date-range-btn" id="dateRangeBtn" type="button">${icon('calendar', 15)} <span id="dateRangeLabel">Last 30 Days</span> ${icon('chevron', 13)}</button>
+            <div class="dropdown-panel date-range-panel" id="dateRangePanel">
+              <button class="date-range-option" data-range="7">Last 7 Days</button>
+              <button class="date-range-option active" data-range="30">Last 30 Days</button>
+              <button class="date-range-option" data-range="90">Last 90 Days</button>
+              <button class="date-range-option" data-range="mtd">Month to Date</button>
+              <button class="date-range-option" data-range="today">Today</button>
+            </div>
+          </div>
+          <div class="dropdown-wrap">
+            <button class="icon-btn" id="bellBtn" type="button" title="Notifications">${icon('bell', 18)}<span class="badge-dot" id="bellBadge" style="display:none">0</span></button>
+            <div class="dropdown-panel bell-panel" id="bellPanel">
+              <div class="bell-panel-head">Notifications</div>
+              <div id="bellPanelBody"><div class="bell-empty">Loading...</div></div>
+            </div>
+          </div>
           <button class="btn primary" id="topbarLogoutBtn">Logout</button>
         </div>
       </div>
 
       <section class="section active" id="dashboard">
         <div class="grid" style="margin-top:0">
-          <article class="card col-3"><div class="card-body stat-tile"><div class="stat-label">Total Revenue</div><div class="stat-value" id="statRevenue">—</div></div></article>
-          <article class="card col-3"><div class="card-body stat-tile"><div class="stat-label">Paid</div><div class="stat-value good" id="statPaid">—</div></div></article>
-          <article class="card col-3"><div class="card-body stat-tile"><div class="stat-label">Pending</div><div class="stat-value warn" id="statPending">—</div></div></article>
-          <article class="card col-3"><div class="card-body stat-tile"><div class="stat-label">Success Rate</div><div class="stat-value" id="statSuccessRate">—</div></div></article>
+          <article class="card col-3"><div class="card-body stat-card">
+            <div class="stat-icon blue">${icon('wallet', 20)}</div>
+            <div><div class="stat-label">Total Revenue</div><div class="stat-value" id="statRevenue">—</div><div class="stat-sub" id="statRevenueSub"></div><div class="stat-delta" id="statRevenueDelta"></div></div>
+          </div></article>
+          <article class="card col-3"><div class="card-body stat-card">
+            <div class="stat-icon green">${icon('check-circle', 20)}</div>
+            <div><div class="stat-label">Paid Invoices</div><div class="stat-value good" id="statPaid">—</div><div class="stat-sub" id="statPaidSub"></div></div>
+          </div></article>
+          <article class="card col-3"><div class="card-body stat-card">
+            <div class="stat-icon orange">${icon('clock', 20)}</div>
+            <div><div class="stat-label">Pending Invoices</div><div class="stat-value warn" id="statPending">—</div><div class="stat-sub" id="statPendingSub"></div></div>
+          </div></article>
+          <article class="card col-3"><div class="card-body stat-card">
+            <div class="stat-icon violet">${icon('trending-up', 20)}</div>
+            <div><div class="stat-label">Success Rate</div><div class="stat-value" id="statSuccessRate">—</div><div class="stat-delta" id="statSuccessRateDelta"></div></div>
+          </div></article>
         </div>
 
         <article class="card" style="margin-top:14px">
-          <h3>Revenue Chart (30 Days)</h3>
-          <div class="card-body"><div id="revenueChart"></div></div>
+          <div class="chart-head">
+            <h3 style="border:0;padding:0">Revenue Chart</h3>
+            <div class="chart-filters">
+              <select class="chart-select" id="chartCurrencyFilter"><option value="all">All Currencies</option></select>
+            </div>
+          </div>
+          <div class="card-body"><div id="revenueChart"></div><div class="chart-legend" id="chartLegend"></div></div>
         </article>
 
         <article class="card" style="margin-top:14px">
-          <h3>Recent Payments</h3>
-          <div class="card-body">
+          <div class="table-head-row">
+            <h3>Recent Invoices</h3>
+            <button class="link-btn" type="button" data-quick-nav="invoices-all">View All Invoices</button>
+          </div>
+          <div class="card-body" style="padding:0 14px 6px">
             <table style="width:100%;border-collapse:collapse;font-size:13px">
-              <thead><tr style="text-align:left;border-bottom:1px solid var(--line)"><th style="padding:6px">Transaction</th><th style="padding:6px">Customer</th><th style="padding:6px">Amount</th><th style="padding:6px">Status</th><th style="padding:6px">Date</th></tr></thead>
-              <tbody id="recentPaymentsBody"><tr><td class="muted" style="padding:6px" colspan="5">Loading...</td></tr></tbody>
+              <thead><tr style="text-align:left;border-bottom:1px solid var(--line)"><th style="padding:6px">Invoice</th><th style="padding:6px">Customer</th><th style="padding:6px">Amount</th><th style="padding:6px">Status</th><th style="padding:6px">Date</th><th style="padding:6px"></th></tr></thead>
+              <tbody id="recentInvoicesBody"><tr><td class="muted" style="padding:6px" colspan="6">Loading...</td></tr></tbody>
             </table>
           </div>
+          <div class="pagination" id="recentInvoicesPagination"></div>
         </article>
 
         <div class="grid" style="margin-top:14px">
@@ -2262,11 +2444,27 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
         };
       }
 
-      document.getElementById('dashWelcome').textContent = 'Welcome, ' + (portal.merchantName || session.displayName || session.username || 'Merchant');
-      if (portal.logoUrl) {
-        document.getElementById('dashLogo').src = portal.logoUrl;
-        document.getElementById('dashLogo').style.display = '';
+      function applyMerchantBranding(name, logoUrl) {
+        const merchantName = name || session.displayName || session.username || 'Merchant';
+        document.getElementById('sidebarBrandName').textContent = merchantName;
+        document.getElementById('sidebarFooterName').textContent = merchantName;
+        const hour = new Date().getHours();
+        const period = hour < 12 ? 'Morning' : (hour < 18 ? 'Afternoon' : 'Evening');
+        document.getElementById('dashGreeting').innerHTML = '<span id="dashGreetingIcon">' + iconMountain + '</span> Good ' + period;
+        document.getElementById('dashWelcome').textContent = 'Welcome, ' + merchantName;
+        if (logoUrl) {
+          document.getElementById('sidebarBrandIcon').innerHTML = '<img src="' + logoUrl + '" alt="Logo" />';
+        } else {
+          document.getElementById('sidebarBrandIcon').innerHTML = iconStore;
+        }
       }
+      var iconMountain = document.getElementById('dashGreetingIcon').innerHTML;
+      var iconStore = document.getElementById('sidebarBrandIcon').innerHTML;
+      applyMerchantBranding(portal.merchantName, portal.logoUrl);
+      const midParts = [];
+      if (portal.usdSettings && portal.usdSettings.merchantId) midParts.push('USD MID: ' + portal.usdSettings.merchantId);
+      if (portal.inrSettings && portal.inrSettings.merchantId) midParts.push('INR MID: ' + portal.inrSettings.merchantId);
+      document.getElementById('sidebarFooterMid').innerHTML = midParts.join('<br/>');
       setText('usdMid', portal.usdSettings && portal.usdSettings.merchantId);
       setText('inrMid', portal.inrSettings && portal.inrSettings.merchantId);
 
@@ -2350,13 +2548,7 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
           if (!res.ok) throw new Error(data.error || 'Unable to save profile.');
 
           msg.textContent = 'Saved.';
-          document.getElementById('dashWelcome').textContent = 'Welcome, ' + (data.profile.merchantName || session.username);
-          if (data.profile.logoUrl) {
-            document.getElementById('dashLogo').src = data.profile.logoUrl;
-            document.getElementById('dashLogo').style.display = '';
-          } else {
-            document.getElementById('dashLogo').style.display = 'none';
-          }
+          applyMerchantBranding(data.profile.merchantName, data.profile.logoUrl);
           editLogo.setInitial(data.profile.logoUrl || '');
           portal.settings = data.profile.settings;
         } catch (error) {
@@ -2467,6 +2659,7 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
             document.getElementById('invoiceResultLink').value = data.paymentUrl;
             document.getElementById('downloadInvoicePdfLink').href = '/api/invoices/' + encodeURIComponent(data.invoice._id) + '/pdf';
             document.getElementById('invoiceResult').style.display = 'block';
+            if (window.refreshDashboardData) window.refreshDashboardData();
           } catch (error) {
             msg.textContent = error.message || 'Error creating invoice.';
           }
@@ -2574,6 +2767,7 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
             const data = await res.json().catch(function () { return {}; });
             if (!res.ok) throw new Error(data.error || 'Unable to delete invoice.');
             loadInvoices();
+            if (window.refreshDashboardData) window.refreshDashboardData();
           } catch (error) {
             window.alert(error.message || 'Error deleting invoice.');
           }
@@ -2672,78 +2866,155 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
 
       (function () {
         const dashCurrencyNames = { '840': 'USD', '356': 'INR', '064': 'BTN' };
+        const paletteOrder = ['#2a78d6', '#1baf7a', '#eda100', '#4a3aa7'];
+        const rangeLabels = { '7': 'Last 7 Days', '30': 'Last 30 Days', '90': 'Last 90 Days', 'mtd': 'Month to Date', 'today': 'Today' };
+        var currentPreset = '30';
+        var lastSummaryData = null;
+        var recentInvoicesCache = [];
+        var recentInvoicesPage = 1;
+        var RECENT_PAGE_SIZE = 5;
 
-        function renderRevenueChart(containerId, series, currencyLabel) {
-          const container = document.getElementById(containerId);
-          const width = Math.max(container.clientWidth || 600, 280);
-          const height = 180;
-          const padLeft = 8, padRight = 8, padTop = 10, padBottom = 22;
+        function computeRangeForPreset(preset) {
+          const now = new Date();
+          const to = now.toISOString().slice(0, 10);
+          var from;
+          if (preset === 'today') {
+            from = to;
+          } else if (preset === 'mtd') {
+            const mtdStart = new Date(now.getFullYear(), now.getMonth(), 1);
+            from = mtdStart.toISOString().slice(0, 10);
+          } else {
+            const days = parseInt(preset, 10) || 30;
+            const fromDate = new Date(now);
+            fromDate.setDate(fromDate.getDate() - (days - 1));
+            from = fromDate.toISOString().slice(0, 10);
+          }
+          return { from: from, to: to };
+        }
+
+        function buildLineChartSvg(series, color, currencyLabel, width, height) {
+          height = height || 140;
+          width = Math.max(width || 600, 220);
+          const padLeft = 8, padRight = 8, padTop = 10, padBottom = 20;
           const plotW = width - padLeft - padRight;
           const plotH = height - padTop - padBottom;
           const maxVal = Math.max.apply(null, series.map(function (p) { return p.amount; }).concat([1]));
-          const gap = 2;
-          const barWidth = Math.max(2, (plotW / series.length) - gap);
-
+          const stepX = series.length > 1 ? plotW / (series.length - 1) : 0;
+          const points = series.map(function (p, i) {
+            const x = padLeft + i * stepX;
+            const y = padTop + plotH - (maxVal > 0 ? (p.amount / maxVal) * plotH : 0);
+            return { x: x, y: y, p: p };
+          });
+          const linePath = points.map(function (pt, i) {
+            return (i === 0 ? 'M' : 'L') + pt.x.toFixed(1) + ' ' + pt.y.toFixed(1);
+          }).join(' ');
+          const areaPath = linePath + ' L' + (padLeft + plotW).toFixed(1) + ' ' + (padTop + plotH) + ' L' + padLeft + ' ' + (padTop + plotH) + ' Z';
           const gridLines = [0.25, 0.5, 0.75, 1].map(function (f) {
             const y = padTop + plotH * (1 - f);
-            return '<line x1="' + padLeft + '" y1="' + y + '" x2="' + (width - padRight) + '" y2="' + y + '" stroke="#e1e0d9" stroke-width="1" />';
+            return '<line x1="' + padLeft + '" y1="' + y + '" x2="' + (width - padRight) + '" y2="' + y + '" stroke="#e5e7eb" stroke-width="1" />';
           }).join('');
-
-          const bars = series.map(function (p, i) {
-            const x = padLeft + i * (barWidth + gap);
-            const barH = maxVal > 0 ? (p.amount / maxVal) * plotH : 0;
-            const y = padTop + plotH - barH;
-            return '<rect x="' + x + '" y="' + y + '" width="' + barWidth + '" height="' + Math.max(barH, 1) + '" rx="2" fill="#2a78d6">' +
-              '<title>' + p.date + ': ' + currencyLabel + ' ' + p.amount.toFixed(2) + '</title></rect>';
+          const dots = points.map(function (pt) {
+            return '<circle cx="' + pt.x.toFixed(1) + '" cy="' + pt.y.toFixed(1) + '" r="2.5" fill="' + color + '"><title>' + pt.p.date + ': ' + currencyLabel + ' ' + pt.p.amount.toFixed(2) + '</title></circle>';
           }).join('');
+          return '<svg viewBox="0 0 ' + width + ' ' + height + '" style="width:100%;height:' + height + 'px" role="img" aria-label="' + currencyLabel + ' revenue">' +
+            gridLines +
+            '<path d="' + areaPath + '" fill="' + color + '" opacity="0.12" stroke="none" />' +
+            '<path d="' + linePath + '" fill="none" stroke="' + color + '" stroke-width="2" />' +
+            dots +
+            '</svg>';
+        }
 
-          const baseline = '<line x1="' + padLeft + '" y1="' + (padTop + plotH) + '" x2="' + (width - padRight) + '" y2="' + (padTop + plotH) + '" stroke="#c3c2b7" stroke-width="1" />';
+        function populateCurrencyFilter(currencies) {
+          const select = document.getElementById('chartCurrencyFilter');
+          const current = select.value || 'all';
+          const options = ['<option value="all">All Currencies</option>'].concat(currencies.map(function (cur) {
+            return '<option value="' + cur + '">' + (dashCurrencyNames[cur] || cur) + '</option>';
+          }));
+          select.innerHTML = options.join('');
+          select.value = (current === 'all' || currencies.indexOf(current) !== -1) ? current : 'all';
+        }
 
-          if (!series.length) {
-            container.innerHTML = '<div class="muted" style="padding:20px 0;text-align:center">No payments in the last 30 days.</div>';
+        function renderRevenueChart(seriesByCurrency, filterCurrency) {
+          const container = document.getElementById('revenueChart');
+          const legend = document.getElementById('chartLegend');
+          const width = Math.max(container.clientWidth || 600, 220);
+          const currencies = Object.keys(seriesByCurrency);
+
+          if (!currencies.length) {
+            container.innerHTML = '<div class="muted" style="padding:20px 0;text-align:center">No paid invoices in this period.</div>';
+            legend.innerHTML = '';
             return;
           }
 
-          container.innerHTML = '<svg viewBox="0 0 ' + width + ' ' + height + '" style="width:100%;height:' + height + 'px" role="img" aria-label="Revenue over the last 30 days">' + gridLines + bars + baseline + '</svg>';
+          if (filterCurrency && filterCurrency !== 'all' && currencies.indexOf(filterCurrency) !== -1) {
+            const idx = currencies.indexOf(filterCurrency);
+            const label = dashCurrencyNames[filterCurrency] || filterCurrency;
+            const series = seriesByCurrency[filterCurrency] || [];
+            container.innerHTML = series.length
+              ? buildLineChartSvg(series, paletteOrder[idx % paletteOrder.length], label, width, 220)
+              : '<div class="muted" style="padding:20px 0;text-align:center">No data for ' + label + '.</div>';
+            legend.innerHTML = '<span><span class="chart-legend-dot" style="background:' + paletteOrder[idx % paletteOrder.length] + '"></span>' + label + '</span>';
+            return;
+          }
+
+          var html = '';
+          currencies.forEach(function (cur, i) {
+            const label = dashCurrencyNames[cur] || cur;
+            const color = paletteOrder[i % paletteOrder.length];
+            const series = seriesByCurrency[cur] || [];
+            html += '<div class="mini-chart-block"><div class="mini-chart-label">' + label + '</div>' +
+              (series.length ? buildLineChartSvg(series, color, label, width, 120) : '<div class="muted" style="padding:12px 0;text-align:center;font-size:12px">No data.</div>') +
+              '</div>';
+          });
+          container.innerHTML = html;
+          legend.innerHTML = currencies.map(function (cur, i) {
+            return '<span><span class="chart-legend-dot" style="background:' + paletteOrder[i % paletteOrder.length] + '"></span>' + (dashCurrencyNames[cur] || cur) + '</span>';
+          }).join('');
+        }
+
+        function renderDelta(elId, pct, isPoints) {
+          const el = document.getElementById(elId);
+          if (pct === undefined || pct === null || pct === 0) {
+            el.className = 'stat-delta flat';
+            el.textContent = 'No change vs previous period';
+            return;
+          }
+          const up = pct > 0;
+          el.className = 'stat-delta ' + (up ? 'up' : 'down');
+          const arrow = up ? '▲' : '▼';
+          const suffix = isPoints ? ' pts vs previous period' : '% vs previous period';
+          el.textContent = arrow + ' ' + (up ? '+' : '') + pct + suffix;
         }
 
         async function loadDashboardSummary() {
           try {
-            const res = await fetch('/api/dashboard-summary', { headers: { 'Accept': 'application/json' } });
+            const range = computeRangeForPreset(currentPreset);
+            const res = await fetch('/api/dashboard-summary?from=' + range.from + '&to=' + range.to, { headers: { 'Accept': 'application/json' } });
             const data = await res.json().catch(function () { return {}; });
             if (!res.ok) throw new Error(data.error || 'Unable to load dashboard.');
+            lastSummaryData = data;
 
             const revenueEntries = Object.entries(data.totalRevenueByCurrency || {});
             document.getElementById('statRevenue').textContent = revenueEntries.length
               ? revenueEntries.map(function (e) { return (dashCurrencyNames[e[0]] || e[0]) + ' ' + Number(e[1]).toFixed(2); }).join(' · ')
               : (dashCurrencyNames[session.defaultCurrency] || session.defaultCurrency || '') + ' 0.00';
-            document.getElementById('statPaid').textContent = String(data.paidCount || 0);
-            document.getElementById('statPending').textContent = String(data.pendingCount || 0);
+            renderDelta('statRevenueDelta', data.revenueDeltaPct);
+
+            document.getElementById('statPaid').textContent = String(data.paidInvoicesCount || 0);
+            document.getElementById('statPaidSub').textContent = (data.paidPctOfTotal || 0) + '% of invoices in range';
+
+            document.getElementById('statPending').textContent = String(data.pendingInvoicesCount || 0);
+            document.getElementById('statPendingSub').textContent = (data.pendingPctOfTotal || 0) + '% of invoices in range';
+
             document.getElementById('statSuccessRate').textContent = (data.successRate || 0) + '%';
+            renderDelta('statSuccessRateDelta', data.successRateDeltaPct, true);
 
-            renderRevenueChart('revenueChart', data.revenueSeries || [], dashCurrencyNames[data.seriesCurrency] || data.seriesCurrency || '');
+            const seriesByCurrency = data.revenueSeriesByCurrency || {};
+            populateCurrencyFilter(Object.keys(seriesByCurrency));
+            renderRevenueChart(seriesByCurrency, document.getElementById('chartCurrencyFilter').value || 'all');
 
-            const recentBody = document.getElementById('recentPaymentsBody');
-            const payments = data.recentPayments || [];
-            if (!payments.length) {
-              recentBody.innerHTML = '<tr><td class="muted" style="padding:6px" colspan="5">No payments yet.</td></tr>';
-            } else {
-              recentBody.innerHTML = payments.map(function (p) {
-                const currencyLabel = dashCurrencyNames[p.currency] || p.currency;
-                const status = String(p.status || '').toLowerCase();
-                const statusLabel = status.charAt(0).toUpperCase() + status.slice(1);
-                return '<tr style="border-top:1px solid #e2e8f0">' +
-                  '<td style="padding:6px">' + p.txnId + '</td>' +
-                  '<td style="padding:6px">' + (p.customerName || '—') + '</td>' +
-                  '<td style="padding:6px">' + currencyLabel + ' ' + Number(p.amountMajor || 0).toFixed(2) + '</td>' +
-                  '<td style="padding:6px"><span class="status-pill ' + status + '">' + statusLabel + '</span></td>' +
-                  '<td style="padding:6px">' + new Date(p.resolvedAt).toLocaleDateString() + '</td>' +
-                  '</tr>';
-              }).join('');
-            }
-
-            document.getElementById('pendingActionsBody').innerHTML = data.pendingCount
-              ? '<p style="margin:0 0 10px">You have <strong>' + data.pendingCount + '</strong> invoice(s) awaiting payment.</p><button class="btn primary" type="button" data-quick-nav="invoices-all">View Pending Invoices</button>'
+            document.getElementById('pendingActionsBody').innerHTML = data.totalPendingCount
+              ? '<p style="margin:0 0 10px">You have <strong>' + data.totalPendingCount + '</strong> invoice(s) awaiting payment.</p><button class="btn primary" type="button" data-quick-nav="invoices-all">View Pending Invoices</button>'
               : '<p class="muted" style="margin:0">No pending invoices right now.</p>';
 
             const merchantIdsByCurrency = (session && session.merchantIdsByCurrency) ? session.merchantIdsByCurrency : {};
@@ -2760,7 +3031,239 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
           }
         }
 
+        document.getElementById('chartCurrencyFilter').addEventListener('change', function (event) {
+          if (lastSummaryData) renderRevenueChart(lastSummaryData.revenueSeriesByCurrency || {}, event.target.value);
+        });
+
+        // Date range dropdown
+        const dateRangeBtn = document.getElementById('dateRangeBtn');
+        const dateRangePanel = document.getElementById('dateRangePanel');
+        dateRangeBtn.addEventListener('click', function (event) {
+          event.stopPropagation();
+          bellPanel.classList.remove('open');
+          dateRangePanel.classList.toggle('open');
+        });
+        dateRangePanel.addEventListener('click', function (event) { event.stopPropagation(); });
+        document.querySelectorAll('.date-range-option').forEach(function (opt) {
+          opt.addEventListener('click', function () {
+            document.querySelectorAll('.date-range-option').forEach(function (o) { o.classList.remove('active'); });
+            opt.classList.add('active');
+            currentPreset = opt.getAttribute('data-range');
+            document.getElementById('dateRangeLabel').textContent = rangeLabels[currentPreset] || opt.textContent;
+            dateRangePanel.classList.remove('open');
+            loadDashboardSummary();
+          });
+        });
+
+        // Notification bell
+        const bellBtn = document.getElementById('bellBtn');
+        const bellPanel = document.getElementById('bellPanel');
+        bellBtn.addEventListener('click', function (event) {
+          event.stopPropagation();
+          dateRangePanel.classList.remove('open');
+          bellPanel.classList.toggle('open');
+          if (bellPanel.classList.contains('open')) loadNotifications(true);
+        });
+        bellPanel.addEventListener('click', function (event) { event.stopPropagation(); });
+
+        document.addEventListener('click', function () {
+          dateRangePanel.classList.remove('open');
+          bellPanel.classList.remove('open');
+        });
+
+        function updateBellBadge(count) {
+          const badge = document.getElementById('bellBadge');
+          if (count > 0) {
+            badge.textContent = count > 9 ? '9+' : String(count);
+            badge.style.display = 'flex';
+          } else {
+            badge.style.display = 'none';
+          }
+        }
+
+        const NOTIF_SEEN_KEY = 'portalNotificationsSeenKeys';
+        function notificationKey(item) { return item.type + ':' + item.invoiceNumber; }
+        function getSeenNotificationKeys() {
+          try { return JSON.parse(window.localStorage.getItem(NOTIF_SEEN_KEY) || '[]'); } catch (e) { return []; }
+        }
+        function saveSeenNotificationKeys(keys) {
+          try { window.localStorage.setItem(NOTIF_SEEN_KEY, JSON.stringify(keys)); } catch (e) { /* ignore storage errors */ }
+        }
+
+        async function loadNotifications(markSeen) {
+          const body = document.getElementById('bellPanelBody');
+          body.innerHTML = '<div class="bell-empty">Loading...</div>';
+          try {
+            const res = await fetch('/api/notifications', { headers: { 'Accept': 'application/json' } });
+            const data = await res.json().catch(function () { return {}; });
+            if (!res.ok) throw new Error(data.error || 'Unable to load notifications.');
+            const items = data.items || [];
+            const currentKeys = items.map(notificationKey);
+            const seenBefore = getSeenNotificationKeys().filter(function (k) { return currentKeys.indexOf(k) !== -1; });
+
+            if (!items.length) {
+              body.innerHTML = '<div class="bell-empty">No notifications right now.</div>';
+              updateBellBadge(0);
+              saveSeenNotificationKeys(seenBefore);
+              return;
+            }
+
+            body.innerHTML = items.map(function (item) {
+              const isUnread = seenBefore.indexOf(notificationKey(item)) === -1;
+              return '<div class="bell-item' + (isUnread ? ' unread' : '') + '"><span class="dot ' + item.type + '"></span><div>' + item.message + '</div></div>';
+            }).join('');
+
+            if (markSeen) {
+              updateBellBadge(0);
+              saveSeenNotificationKeys(currentKeys);
+            } else {
+              const unreadCount = items.filter(function (item) { return seenBefore.indexOf(notificationKey(item)) === -1; }).length;
+              updateBellBadge(unreadCount);
+              saveSeenNotificationKeys(seenBefore);
+            }
+          } catch (error) {
+            body.innerHTML = '<div class="bell-empty">Unable to load notifications.</div>';
+          }
+        }
+
+        function escapeHtmlLocal(value) {
+          return String(value == null ? '' : value).replace(/[&<>"']/g, function (c) {
+            return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+          });
+        }
+
+        function showRecentInvoiceDetail(invoiceNumber) {
+          const inv = recentInvoicesCache.find(function (i) { return i._id === invoiceNumber; });
+          if (!inv) return;
+          const currencyLabel = dashCurrencyNames[inv.currency] || inv.currency;
+          const rows = [
+            ['Invoice Number', inv._id],
+            ['Customer Name', inv.customerName || ''],
+            ['Amount', currencyLabel + ' ' + Number(inv.amount || 0).toFixed(2)],
+            ['Status', String(inv.status || 'pending').toUpperCase()],
+            ['Invoice Date', new Date(inv.invoiceDate).toLocaleString()],
+            ['Due Date', new Date(inv.dueDate).toLocaleString()],
+          ];
+          const modal = document.getElementById('detailModal');
+          document.getElementById('detailModalTitle').textContent = 'Invoice ' + inv._id;
+          document.getElementById('detailModalBody').innerHTML = rows.map(function (row) {
+            return '<div class="kv"><div class="k">' + row[0] + '</div><div>' + escapeHtmlLocal(row[1] || '—') + '</div></div>';
+          }).join('');
+          const logo = document.getElementById('detailModalLogo');
+          if (portal.logoUrl) { logo.src = portal.logoUrl; logo.style.display = ''; } else { logo.style.display = 'none'; }
+          const pdfLink = document.getElementById('detailModalPdfLink');
+          pdfLink.href = '/api/invoices/' + encodeURIComponent(inv._id) + '/pdf';
+          pdfLink.style.display = '';
+          modal.style.display = 'flex';
+        }
+
+        async function copyRecentInvoiceLink(token, btn) {
+          try {
+            await navigator.clipboard.writeText(window.location.origin + '/pay/' + token);
+            const original = btn.innerHTML;
+            btn.innerHTML = '✓';
+            setTimeout(function () { btn.innerHTML = original; }, 1200);
+          } catch (error) {
+            window.alert('Unable to copy link.');
+          }
+        }
+
+        function renderRecentInvoicesPage() {
+          const tbody = document.getElementById('recentInvoicesBody');
+          const totalPages = Math.max(1, Math.ceil(recentInvoicesCache.length / RECENT_PAGE_SIZE));
+          if (recentInvoicesPage > totalPages) recentInvoicesPage = totalPages;
+          const start = (recentInvoicesPage - 1) * RECENT_PAGE_SIZE;
+          const pageItems = recentInvoicesCache.slice(start, start + RECENT_PAGE_SIZE);
+
+          if (!pageItems.length) {
+            tbody.innerHTML = '<tr><td class="muted" style="padding:6px" colspan="6">No invoices yet.</td></tr>';
+          } else {
+            tbody.innerHTML = pageItems.map(function (inv) {
+              const currencyLabel = dashCurrencyNames[inv.currency] || inv.currency;
+              const amount = Number(inv.amount || 0).toFixed(2);
+              const created = new Date(inv.createdAt).toLocaleDateString();
+              const status = String(inv.status || 'pending').toLowerCase();
+              const statusLabel = status.charAt(0).toUpperCase() + status.slice(1);
+              const copyBtn = (status === 'pending' && inv.paymentLinkToken)
+                ? '<button class="row-icon-btn" data-copy-recent-invoice="' + inv.paymentLinkToken + '" title="Copy payment link">🔗</button>'
+                : '';
+              return '<tr style="border-top:1px solid #e2e8f0">' +
+                '<td style="padding:6px">' + inv._id + '</td>' +
+                '<td style="padding:6px">' + (inv.customerName || '—') + '</td>' +
+                '<td style="padding:6px">' + currencyLabel + ' ' + amount + '</td>' +
+                '<td style="padding:6px"><span class="status-pill ' + status + '">' + statusLabel + '</span></td>' +
+                '<td style="padding:6px">' + created + '</td>' +
+                '<td style="padding:6px"><div class="row-icon-buttons"><button class="row-icon-btn" data-view-recent-invoice="' + inv._id + '" title="View details">👁️</button>' + copyBtn + '</div></td>' +
+                '</tr>';
+            }).join('');
+          }
+
+          const pagination = document.getElementById('recentInvoicesPagination');
+          if (totalPages <= 1) {
+            pagination.innerHTML = '';
+            return;
+          }
+          var buttons = '<button class="page-btn" type="button" data-page="prev"' + (recentInvoicesPage === 1 ? ' disabled' : '') + '>&lsaquo;</button>';
+          for (var p = 1; p <= totalPages; p++) {
+            buttons += '<button class="page-btn ' + (p === recentInvoicesPage ? 'active' : '') + '" type="button" data-page="' + p + '">' + p + '</button>';
+          }
+          buttons += '<button class="page-btn" type="button" data-page="next"' + (recentInvoicesPage === totalPages ? ' disabled' : '') + '>&rsaquo;</button>';
+          pagination.innerHTML = buttons;
+        }
+
+        async function loadRecentInvoices() {
+          try {
+            const res = await fetch('/api/invoices', { headers: { 'Accept': 'application/json' } });
+            const data = await res.json().catch(function () { return {}; });
+            if (!res.ok) throw new Error(data.error || 'Unable to load invoices.');
+            recentInvoicesCache = (data.invoices || []).slice().sort(function (a, b) {
+              return new Date(b.createdAt) - new Date(a.createdAt);
+            });
+            recentInvoicesPage = 1;
+            renderRecentInvoicesPage();
+          } catch (error) {
+            document.getElementById('recentInvoicesBody').innerHTML = '<tr><td class="muted" style="padding:6px" colspan="6">Unable to load invoices.</td></tr>';
+          }
+        }
+
+        document.getElementById('recentInvoicesPagination').addEventListener('click', function (event) {
+          const btn = event.target.closest('[data-page]');
+          if (!btn) return;
+          const totalPages = Math.max(1, Math.ceil(recentInvoicesCache.length / RECENT_PAGE_SIZE));
+          const val = btn.getAttribute('data-page');
+          if (val === 'prev') recentInvoicesPage = Math.max(1, recentInvoicesPage - 1);
+          else if (val === 'next') recentInvoicesPage = Math.min(totalPages, recentInvoicesPage + 1);
+          else recentInvoicesPage = parseInt(val, 10) || 1;
+          renderRecentInvoicesPage();
+        });
+
+        document.getElementById('recentInvoicesBody').addEventListener('click', function (event) {
+          const viewBtn = event.target.closest('[data-view-recent-invoice]');
+          if (viewBtn) return showRecentInvoiceDetail(viewBtn.getAttribute('data-view-recent-invoice'));
+          const copyBtn = event.target.closest('[data-copy-recent-invoice]');
+          if (copyBtn) return copyRecentInvoiceLink(copyBtn.getAttribute('data-copy-recent-invoice'), copyBtn);
+        });
+
+        function refreshDashboardData() {
+          loadDashboardSummary();
+          loadRecentInvoices();
+          loadNotifications();
+        }
+
+        sectionLoaders['dashboard'] = refreshDashboardData;
+        window.refreshDashboardData = refreshDashboardData;
+
+        setInterval(function () {
+          if (document.visibilityState === 'visible') refreshDashboardData();
+        }, 30000);
+
+        document.addEventListener('visibilitychange', function () {
+          if (document.visibilityState === 'visible') refreshDashboardData();
+        });
+
         loadDashboardSummary();
+        loadRecentInvoices();
+        loadNotifications();
       })();
 
       if (session.role === 'developer') {
@@ -2917,7 +3420,7 @@ async function handleLogin(req, res) {
   const token = crypto.randomBytes(24).toString('base64url');
   const createdAt = new Date();
   const expiresAt = new Date(createdAt.getTime() + SESSION_TTL_MS);
-  sessionStore.set(token, {
+  const sessionData = {
     token,
     username: user.username,
     displayName: user.displayName,
@@ -2927,25 +3430,26 @@ async function handleLogin(req, res) {
     defaultCurrency: user.defaultCurrency,
     createdAt: createdAt.toISOString(),
     expiresAt: expiresAt.toISOString(),
-  });
+  };
+  await saveSessionRecord(token, sessionData);
 
   setSessionCookie(res, token, Math.floor(SESSION_TTL_MS / 1000));
   return json(res, 200, {
     ok: true,
-    user: buildSessionClientView(sessionStore.get(token)),
+    user: buildSessionClientView(sessionData),
     expiresAt: expiresAt.toISOString(),
   });
 }
 
-function handleLogout(req, res) {
+async function handleLogout(req, res) {
   const token = getSessionTokenFromRequest(req);
-  if (token) sessionStore.delete(token);
+  if (token) await deleteSessionRecord(token);
   clearSessionCookie(res);
   return json(res, 200, { ok: true });
 }
 
-function handleSessionInfo(req, res) {
-  const session = getAuthenticatedSession(req);
+async function handleSessionInfo(req, res) {
+  const session = await getAuthenticatedSession(req);
   if (!session) {
     return json(res, 401, { authenticated: false });
   }
@@ -2958,7 +3462,7 @@ function handleSessionInfo(req, res) {
 }
 
 async function handleChangePassword(req, res) {
-  const session = getAuthenticatedSession(req);
+  const session = await getAuthenticatedSession(req);
   if (!session) return json(res, 401, { error: 'Login required' });
 
   const raw = await parseBody(req);
@@ -2993,7 +3497,7 @@ async function handleChangePassword(req, res) {
 }
 
 async function handleChangeUsername(req, res) {
-  const session = getAuthenticatedSession(req);
+  const session = await getAuthenticatedSession(req);
   if (!session) return json(res, 401, { error: 'Login required' });
 
   const raw = await parseBody(req);
@@ -3039,14 +3543,14 @@ async function handleChangeUsername(req, res) {
   }
 
   const token = getSessionTokenFromRequest(req);
-  if (token) sessionStore.delete(token);
+  if (token) await deleteSessionRecord(token);
   clearSessionCookie(res);
 
   return json(res, 200, { ok: true, newUsername });
 }
 
 async function handleUpdateMerchantProfile(req, res) {
-  const session = getAuthenticatedSession(req);
+  const session = await getAuthenticatedSession(req);
   if (!session) return json(res, 401, { error: 'Login required' });
 
   const raw = await parseBody(req);
@@ -3129,7 +3633,7 @@ async function getUnassignedMerchantIds() {
 }
 
 async function handleListDeveloperMerchants(req, res) {
-  const session = getAuthenticatedSession(req);
+  const session = await getAuthenticatedSession(req);
   if (!session || session.role !== 'developer') {
     return json(res, 403, { error: 'Developer access required' });
   }
@@ -3149,7 +3653,7 @@ async function handleListDeveloperMerchants(req, res) {
 }
 
 async function handleCreateDeveloperMerchant(req, res) {
-  const session = getAuthenticatedSession(req);
+  const session = await getAuthenticatedSession(req);
   if (!session || session.role !== 'developer') {
     return json(res, 403, { error: 'Developer access required' });
   }
@@ -3239,7 +3743,7 @@ async function handleInitiate(req, res) {
   const input = parseRawPayload(raw, contentType);
 
   const requestedCurrency = normalizeCurrency(input.currency);
-  const session = getAuthenticatedSession(req);
+  const session = await getAuthenticatedSession(req);
   const amount = String(input.amount || '').trim();
   const orderRefInput = String(input.orderRef || '').trim();
   const customerRefInput = String(input.customerRef || '').trim();
@@ -3777,7 +4281,7 @@ async function handleMerchantCurrency(req, res) {
 }
 
 async function handleCreatePaymentLink(req, res) {
-  const session = getAuthenticatedSession(req);
+  const session = await getAuthenticatedSession(req);
   if (!session) {
     return json(res, 401, { error: 'Login required' });
   }
@@ -3843,7 +4347,7 @@ async function handleCreatePaymentLink(req, res) {
 }
 
 async function handleCreateInvoice(req, res) {
-  const session = getAuthenticatedSession(req);
+  const session = await getAuthenticatedSession(req);
   if (!session) return json(res, 401, { error: 'Login required' });
 
   const raw = await parseBody(req);
@@ -3923,7 +4427,7 @@ async function handleCreateInvoice(req, res) {
 }
 
 async function handleListInvoices(req, res) {
-  const session = getAuthenticatedSession(req);
+  const session = await getAuthenticatedSession(req);
   if (!session) return json(res, 401, { error: 'Login required' });
 
   const u = new URL(req.url, `http://${req.headers.host}`);
@@ -3934,7 +4438,7 @@ async function handleListInvoices(req, res) {
 }
 
 async function handleDeleteInvoice(req, res, invoiceNumber) {
-  const session = getAuthenticatedSession(req);
+  const session = await getAuthenticatedSession(req);
   if (!session) return json(res, 401, { error: 'Login required' });
 
   const invoice = await getInvoice(invoiceNumber);
@@ -3954,7 +4458,7 @@ async function handleDeleteInvoice(req, res, invoiceNumber) {
 }
 
 async function handleListTransactions(req, res) {
-  const session = getAuthenticatedSession(req);
+  const session = await getAuthenticatedSession(req);
   if (!session) return json(res, 401, { error: 'Login required' });
 
   const transactions = await listTransactionsForUsername(session.username);
@@ -3962,7 +4466,7 @@ async function handleListTransactions(req, res) {
 }
 
 async function handleSendInvoiceEmail(req, res, invoiceNumber) {
-  const session = getAuthenticatedSession(req);
+  const session = await getAuthenticatedSession(req);
   if (!session) return json(res, 401, { error: 'Login required' });
 
   const invoice = await getInvoice(invoiceNumber);
@@ -4040,7 +4544,7 @@ async function handleSendInvoiceEmail(req, res, invoiceNumber) {
 }
 
 async function handleListEmailLogs(req, res) {
-  const session = getAuthenticatedSession(req);
+  const session = await getAuthenticatedSession(req);
   if (!session) return json(res, 401, { error: 'Login required' });
 
   const emails = await listEmailLogsForUsername(session.username);
@@ -4048,7 +4552,7 @@ async function handleListEmailLogs(req, res) {
 }
 
 async function handleDownloadTransactionPdf(req, res, txnId) {
-  const session = getAuthenticatedSession(req);
+  const session = await getAuthenticatedSession(req);
   if (!session) return json(res, 401, { error: 'Login required' });
 
   const db = await getMongoDb();
@@ -4069,68 +4573,163 @@ async function handleDownloadTransactionPdf(req, res, txnId) {
 }
 
 async function handleDashboardSummary(req, res) {
-  const session = getAuthenticatedSession(req);
+  const session = await getAuthenticatedSession(req);
   if (!session) return json(res, 401, { error: 'Login required' });
 
   const db = await getMongoDb();
   const username = session.username;
 
-  const allTx = await listTransactionsForUsername(username);
-  const paid = allTx.filter(t => t.status === 'paid');
-  const failed = allTx.filter(t => t.status === 'failed');
-
-  const totalRevenueByCurrency = {};
-  for (const t of paid) {
-    const cur = t.currency || '—';
-    totalRevenueByCurrency[cur] = (totalRevenueByCurrency[cur] || 0) + Number(t.amountMajor || 0);
-  }
-
-  const successRate = (paid.length + failed.length) > 0
-    ? Math.round((paid.length / (paid.length + failed.length)) * 1000) / 10
-    : 0;
-
-  const seriesCurrency = Object.keys(totalRevenueByCurrency)[0] || normalizeCurrency(session.defaultCurrency) || '';
+  const u = new URL(req.url, `http://${req.headers.host}`);
   const now = new Date();
-  const days = [];
-  for (let i = 29; i >= 0; i--) {
-    const d = new Date(now);
-    d.setDate(d.getDate() - i);
-    days.push(d.toISOString().slice(0, 10));
-  }
-  const dayTotals = {};
-  days.forEach(d => { dayTotals[d] = 0; });
-  for (const t of paid) {
-    if ((t.currency || '') !== seriesCurrency) continue;
-    const day = String(t.resolvedAt || '').slice(0, 10);
-    if (day in dayTotals) dayTotals[day] += Number(t.amountMajor || 0);
-  }
-  const revenueSeries = days.map(d => ({ date: d, amount: Math.round(dayTotals[d] * 100) / 100 }));
+  const defaultTo = now.toISOString().slice(0, 10);
+  const defaultFromDate = new Date(now);
+  defaultFromDate.setDate(defaultFromDate.getDate() - 29);
+  const defaultFrom = defaultFromDate.toISOString().slice(0, 10);
 
-  const pendingInvoicesCount = await db.collection('invoices').countDocuments({ username, status: 'pending' });
+  const fromParam = String(u.searchParams.get('from') || '').trim();
+  const toParam = String(u.searchParams.get('to') || '').trim();
+  const from = /^\d{4}-\d{2}-\d{2}$/.test(fromParam) ? fromParam : defaultFrom;
+  const to = /^\d{4}-\d{2}-\d{2}$/.test(toParam) ? toParam : defaultTo;
 
-  const recentPayments = allTx.slice(0, 8).map(t => ({
-    txnId: t._id,
-    customerName: t.customerName,
-    amountMajor: t.amountMajor,
-    currency: t.currency,
-    status: t.status,
-    resolvedAt: t.resolvedAt,
-  }));
+  const fromDate = new Date(`${from}T00:00:00.000Z`);
+  const toDate = new Date(`${to}T23:59:59.999Z`);
+  const rangeMs = toDate.getTime() - fromDate.getTime();
+  const prevToDate = new Date(fromDate.getTime() - 1);
+  const prevFromDate = new Date(prevToDate.getTime() - rangeMs);
+
+  const allInvoices = await db.collection('invoices').find({ username }).toArray();
+
+  const inRange = (dateIso, start, end) => {
+    const t = Date.parse(dateIso);
+    return !Number.isNaN(t) && t >= start.getTime() && t <= end.getTime();
+  };
+
+  const currentInvoices = allInvoices.filter(inv => inRange(inv.invoiceDate, fromDate, toDate));
+  const prevInvoices = allInvoices.filter(inv => inRange(inv.invoiceDate, prevFromDate, prevToDate));
+
+  function summarize(invoices) {
+    const paid = invoices.filter(i => i.status === 'paid');
+    const pending = invoices.filter(i => i.status === 'pending');
+    const failed = invoices.filter(i => i.status === 'failed');
+    const revenueByCurrency = {};
+    for (const inv of paid) {
+      const cur = normalizeCurrency(inv.currency) || inv.currency || '—';
+      revenueByCurrency[cur] = (revenueByCurrency[cur] || 0) + Number(inv.amount || 0);
+    }
+    const pendingByCurrency = {};
+    for (const inv of pending) {
+      const cur = normalizeCurrency(inv.currency) || inv.currency || '—';
+      pendingByCurrency[cur] = (pendingByCurrency[cur] || 0) + Number(inv.amount || 0);
+    }
+    const totalRevenue = Object.values(revenueByCurrency).reduce((a, b) => a + b, 0);
+    const successRate = (paid.length + failed.length) > 0
+      ? Math.round((paid.length / (paid.length + failed.length)) * 1000) / 10
+      : 0;
+    return {
+      total: invoices.length,
+      paidCount: paid.length,
+      pendingCount: pending.length,
+      failedCount: failed.length,
+      revenueByCurrency,
+      pendingByCurrency,
+      totalRevenue,
+      successRate,
+    };
+  }
+
+  const current = summarize(currentInvoices);
+  const previous = summarize(prevInvoices);
+
+  function pctDelta(curVal, prevVal) {
+    if (prevVal <= 0) return curVal > 0 ? 100 : 0;
+    return Math.round(((curVal - prevVal) / prevVal) * 1000) / 10;
+  }
+
+  const revenueDeltaPct = pctDelta(current.totalRevenue, previous.totalRevenue);
+  const successRateDeltaPct = Math.round((current.successRate - previous.successRate) * 10) / 10;
+  const paidPctOfTotal = current.total > 0 ? Math.round((current.paidCount / current.total) * 1000) / 10 : 0;
+  const pendingPctOfTotal = current.total > 0 ? Math.round((current.pendingCount / current.total) * 1000) / 10 : 0;
+
+  const dayKeys = [];
+  {
+    const cursor = new Date(fromDate);
+    while (cursor.getTime() <= toDate.getTime()) {
+      dayKeys.push(cursor.toISOString().slice(0, 10));
+      cursor.setDate(cursor.getDate() + 1);
+    }
+  }
+
+  const revenueSeriesByCurrency = {};
+  for (const cur of Object.keys(current.revenueByCurrency)) {
+    const dayTotals = {};
+    dayKeys.forEach(d => { dayTotals[d] = 0; });
+    for (const inv of currentInvoices) {
+      if (inv.status !== 'paid') continue;
+      const invCur = normalizeCurrency(inv.currency) || inv.currency;
+      if (invCur !== cur) continue;
+      const day = String(inv.invoiceDate || '').slice(0, 10);
+      if (day in dayTotals) dayTotals[day] += Number(inv.amount || 0);
+    }
+    revenueSeriesByCurrency[cur] = dayKeys.map(d => ({ date: d, amount: Math.round(dayTotals[d] * 100) / 100 }));
+  }
+
+  const totalPendingCount = allInvoices.filter(i => i.status === 'pending').length;
 
   return json(res, 200, {
-    totalRevenueByCurrency,
-    paidCount: paid.length,
-    pendingCount: pendingInvoicesCount,
-    failedCount: failed.length,
-    successRate,
-    seriesCurrency,
-    revenueSeries,
-    recentPayments,
+    from,
+    to,
+    totalRevenueByCurrency: current.revenueByCurrency,
+    revenueDeltaPct,
+    paidInvoicesCount: current.paidCount,
+    paidByCurrency: current.revenueByCurrency,
+    paidPctOfTotal,
+    pendingInvoicesCount: current.pendingCount,
+    pendingByCurrency: current.pendingByCurrency,
+    pendingPctOfTotal,
+    successRate: current.successRate,
+    successRateDeltaPct,
+    revenueSeriesByCurrency,
+    totalPendingCount,
   });
 }
 
+async function handleListNotifications(req, res) {
+  const session = await getAuthenticatedSession(req);
+  if (!session) return json(res, 401, { error: 'Login required' });
+
+  const db = await getMongoDb();
+  const username = session.username;
+  const now = Date.now();
+  const soonMs = 2 * 24 * 60 * 60 * 1000;
+  const recentFailMs = 7 * 24 * 60 * 60 * 1000;
+  const items = [];
+
+  const pendingInvoices = await db.collection('invoices').find({ username, status: 'pending' }).toArray();
+  for (const inv of pendingInvoices) {
+    const dueAt = Date.parse(inv.dueDate);
+    if (Number.isNaN(dueAt)) continue;
+    if (dueAt < now) {
+      items.push({ type: 'overdue', invoiceNumber: inv._id, message: `Invoice ${inv._id} is overdue`, at: inv.dueDate });
+    } else if (dueAt - now <= soonMs) {
+      items.push({ type: 'due-soon', invoiceNumber: inv._id, message: `Invoice ${inv._id} is due soon`, at: inv.dueDate });
+    }
+  }
+
+  const recentFailed = await db.collection('invoices').find({ username, status: 'failed' }).toArray();
+  for (const inv of recentFailed) {
+    const updatedAt = Date.parse(inv.updatedAt);
+    if (!Number.isNaN(updatedAt) && now - updatedAt <= recentFailMs) {
+      items.push({ type: 'failed', invoiceNumber: inv._id, message: `Payment for invoice ${inv._id} failed`, at: inv.updatedAt });
+    }
+  }
+
+  items.sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+
+  return json(res, 200, { count: items.length, items });
+}
+
 async function handleDownloadInvoicePdf(req, res, invoiceNumber) {
-  const session = getAuthenticatedSession(req);
+  const session = await getAuthenticatedSession(req);
   if (!session) return json(res, 401, { error: 'Login required' });
 
   const invoice = await getInvoice(invoiceNumber);
@@ -4352,7 +4951,7 @@ module.exports = async function handler(req, res) {
     }
 
     if (req.method === 'GET' && u.pathname === '/login') {
-      const existingSession = getAuthenticatedSession(req);
+      const existingSession = await getAuthenticatedSession(req);
       if (existingSession) {
         return redirect(res, '/portal');
       }
@@ -4364,11 +4963,11 @@ module.exports = async function handler(req, res) {
     }
 
     if (req.method === 'POST' && (u.pathname === '/api/logout' || u.pathname === '/logout')) {
-      return handleLogout(req, res);
+      return await handleLogout(req, res);
     }
 
     if (req.method === 'GET' && (u.pathname === '/api/session' || u.pathname === '/session')) {
-      return handleSessionInfo(req, res);
+      return await handleSessionInfo(req, res);
     }
 
     if (req.method === 'POST' && u.pathname === '/api/account/password') {
@@ -4392,7 +4991,7 @@ module.exports = async function handler(req, res) {
     }
 
     if (req.method === 'GET' && (u.pathname === '/' || u.pathname === '/portal')) {
-      const session = getAuthenticatedSession(req);
+      const session = await getAuthenticatedSession(req);
       if (!session) {
         return redirect(res, '/login');
       }
@@ -4445,6 +5044,10 @@ module.exports = async function handler(req, res) {
 
     if (req.method === 'GET' && u.pathname === '/api/dashboard-summary') {
       return await handleDashboardSummary(req, res);
+    }
+
+    if (req.method === 'GET' && u.pathname === '/api/notifications') {
+      return await handleListNotifications(req, res);
     }
 
     if (req.method === 'POST' && /^\/api\/invoices\/[^/]+\/send-email$/.test(u.pathname)) {
