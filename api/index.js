@@ -1050,11 +1050,6 @@ function txFilePath(txnId) {
   return path.join(TEMP_DIR, `txn_${safeId}.json`);
 }
 
-function paymentLinkFilePath(token) {
-  const safeToken = String(token || '').replace(/[^a-zA-Z0-9_-]/g, '');
-  return path.join(TEMP_DIR, `paylink_${safeToken}.json`);
-}
-
 async function saveTransaction(tx) {
   txStore.set(tx.txnId, tx);
   await fs.mkdir(TEMP_DIR, { recursive: true });
@@ -1078,21 +1073,32 @@ async function getTransaction(txnId) {
   }
 }
 
+let paymentLinksIndexEnsured = false;
+function ensurePaymentLinksIndex(db) {
+  if (paymentLinksIndexEnsured) return;
+  paymentLinksIndexEnsured = true;
+  db.collection('paymentLinks').createIndex({ createdAtDate: 1 }, { expireAfterSeconds: 30 * 24 * 60 * 60 }).catch(() => {});
+}
+
 async function savePaymentLink(link) {
-  await fs.mkdir(TEMP_DIR, { recursive: true });
-  await fs.writeFile(paymentLinkFilePath(link.token), JSON.stringify(link, null, 2), 'utf8');
+  const db = await getMongoDb();
+  ensurePaymentLinksIndex(db);
+  await db.collection('paymentLinks').replaceOne(
+    { _id: link.token },
+    { _id: link.token, ...link, createdAtDate: link.createdAt ? new Date(link.createdAt) : new Date() },
+    { upsert: true }
+  );
 }
 
 async function getPaymentLink(token) {
   const id = String(token || '').trim();
   if (!id) return null;
 
-  try {
-    const content = await fs.readFile(paymentLinkFilePath(id), 'utf8');
-    return JSON.parse(content);
-  } catch {
-    return null;
-  }
+  const db = await getMongoDb();
+  const doc = await db.collection('paymentLinks').findOne({ _id: id });
+  if (!doc) return null;
+  const { _id, createdAtDate, ...link } = doc;
+  return link;
 }
 
 function generatePaymentLinkToken() {
