@@ -1945,7 +1945,6 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
           <button class="menu-item nav-btn" data-target="invoices-create">Create Invoice</button>
           <button class="menu-item nav-btn" data-target="invoices-all">View All Invoices</button>
           <button class="menu-item nav-btn" data-target="invoices-payments">View My Payments</button>
-          <button class="menu-item nav-btn" data-target="invoices-emails">View Emails Sent</button>
         </div>
       </div>
 
@@ -2087,20 +2086,6 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
                 <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
                   <button class="btn" type="button" id="copyInvoiceLinkBtn">Copy Payment Link</button>
                   <a id="downloadInvoicePdfLink" href="#" target="_blank"><button class="btn" type="button">Download PDF Invoice</button></a>
-                  <button class="btn" type="button" id="emailInvoiceBtn">Email Invoice</button>
-                </div>
-              </div>
-
-              <div id="emailInvoicePanel" style="display:none;margin-top:14px;border:1px solid var(--line);border-radius:8px;overflow:hidden">
-                <h3 style="margin:0;padding:12px 14px;border-bottom:1px solid var(--line);font-size:15px">Send Invoice to Customer</h3>
-                <div style="padding:12px 14px">
-                  <div class="muted" style="font-weight:700;margin-bottom:6px">Invoice Details</div>
-                  <div class="kv"><div class="k">Invoice No</div><div id="emailInvoiceNumberVal"></div></div>
-                  <div class="kv"><div class="k">Customer Name</div><div id="emailInvoiceCustomerVal"></div></div>
-                  <div class="kv"><div class="k">Amount</div><div id="emailInvoiceAmountVal"></div></div>
-                  <div style="margin-top:14px"><label for="emailInvoiceTo" style="display:block;font-size:12.5px;font-weight:700;margin-bottom:6px">Email address to send invoice to</label><input id="emailInvoiceTo" type="email" /></div>
-                  <div style="margin-top:10px"><label for="emailInvoiceMessage" style="display:block;font-size:12.5px;font-weight:700;margin-bottom:6px">Message (Optional)</label><textarea id="emailInvoiceMessage" rows="4"></textarea></div>
-                  <div class="form-actions"><button class="btn primary" type="button" id="sendInvoiceEmailBtn">&#9993;&nbsp;Send Invoice</button><span id="emailInvoiceMsg" class="muted"></span></div>
                 </div>
               </div>
             </div>
@@ -2127,18 +2112,6 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
             <table style="width:100%;border-collapse:collapse;font-size:13px">
               <thead><tr style="text-align:left;border-bottom:1px solid var(--line)"><th style="padding:6px">Transaction ID</th><th style="padding:6px">Customer</th><th style="padding:6px">Amount</th><th style="padding:6px">Status</th><th style="padding:6px">Date</th><th style="padding:6px">Actions</th></tr></thead>
               <tbody id="paymentsTableBody"><tr><td class="muted" style="padding:6px" colspan="6">Loading...</td></tr></tbody>
-            </table>
-          </div>
-        </div>
-      </section>
-
-      <section class="section" id="invoices-emails">
-        <div class="card">
-          <h3>View Emails Sent</h3>
-          <div class="card-body">
-            <table style="width:100%;border-collapse:collapse;font-size:13px">
-              <thead><tr style="text-align:left;border-bottom:1px solid var(--line)"><th style="padding:6px">Invoice #</th><th style="padding:6px">To</th><th style="padding:6px">From</th><th style="padding:6px">Status</th><th style="padding:6px">Sent</th></tr></thead>
-              <tbody id="emailsTableBody"><tr><td class="muted" style="padding:6px" colspan="5">Loading...</td></tr></tbody>
             </table>
           </div>
         </div>
@@ -2494,7 +2467,6 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
             document.getElementById('invoiceResultLink').value = data.paymentUrl;
             document.getElementById('downloadInvoicePdfLink').href = '/api/invoices/' + encodeURIComponent(data.invoice._id) + '/pdf';
             document.getElementById('invoiceResult').style.display = 'block';
-            document.getElementById('emailInvoicePanel').style.display = 'none';
           } catch (error) {
             msg.textContent = error.message || 'Error creating invoice.';
           }
@@ -2512,41 +2484,6 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
           }
         });
 
-        document.getElementById('emailInvoiceBtn').addEventListener('click', function () {
-          if (!lastCreatedInvoice) return;
-          const currencyLabel = currencyNamesInv[lastCreatedInvoice.currency] || lastCreatedInvoice.currency;
-          document.getElementById('emailInvoiceNumberVal').textContent = lastCreatedInvoice._id;
-          document.getElementById('emailInvoiceCustomerVal').textContent = lastCreatedInvoice.customerName || '';
-          document.getElementById('emailInvoiceAmountVal').textContent = currencyLabel + ' ' + Number(lastCreatedInvoice.amount).toFixed(2);
-          document.getElementById('emailInvoiceTo').value = lastCreatedInvoice.customerEmail || '';
-          document.getElementById('emailInvoiceMessage').value = lastCreatedInvoice.customerMessage || '';
-          document.getElementById('emailInvoiceMsg').textContent = '';
-          document.getElementById('emailInvoicePanel').style.display = 'block';
-        });
-
-        document.getElementById('sendInvoiceEmailBtn').addEventListener('click', async function () {
-          if (!lastCreatedInvoice) return;
-          const msg = document.getElementById('emailInvoiceMsg');
-          const toEmail = document.getElementById('emailInvoiceTo').value.trim();
-          const message = document.getElementById('emailInvoiceMessage').value.trim();
-          if (!toEmail) {
-            msg.textContent = 'Enter a recipient email address.';
-            return;
-          }
-          msg.textContent = 'Sending...';
-          try {
-            const res = await fetch('/api/invoices/' + encodeURIComponent(lastCreatedInvoice._id) + '/send-email', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ to: toEmail, message: message })
-            });
-            const data = await res.json().catch(function () { return {}; });
-            if (!res.ok) throw new Error(data.error || 'Unable to send email.');
-            msg.textContent = 'Email sent to ' + toEmail + '.';
-          } catch (error) {
-            msg.textContent = error.message || 'Error sending email.';
-          }
-        });
 
         let invoicesCache = [];
         let paymentsCache = [];
@@ -2729,35 +2666,8 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
           if (viewBtn) return viewPaymentDetails(viewBtn.getAttribute('data-view-txn'));
         });
 
-        async function loadEmails() {
-          const tbody = document.getElementById('emailsTableBody');
-          try {
-            const res = await fetch('/api/emails', { headers: { 'Accept': 'application/json' } });
-            const data = await res.json().catch(function () { return {}; });
-            const emails = data.emails || [];
-            if (!emails.length) {
-              tbody.innerHTML = '<tr><td class="muted" style="padding:6px" colspan="5">No emails sent yet.</td></tr>';
-              return;
-            }
-            tbody.innerHTML = emails.map(function (e) {
-              const status = String(e.status || '').toLowerCase();
-              const statusLabel = status.charAt(0).toUpperCase() + status.slice(1);
-              return '<tr style="border-top:1px solid #e2e8f0">' +
-                '<td style="padding:6px">' + e.invoiceNumber + '</td>' +
-                '<td style="padding:6px">' + e.to + '</td>' +
-                '<td style="padding:6px">' + e.from + '</td>' +
-                '<td style="padding:6px"><span class="status-pill ' + (status === 'sent' ? 'paid' : 'failed') + '">' + statusLabel + '</span></td>' +
-                '<td style="padding:6px">' + new Date(e.sentAt).toLocaleString() + '</td>' +
-                '</tr>';
-            }).join('');
-          } catch (error) {
-            tbody.innerHTML = '<tr><td class="muted" style="padding:6px" colspan="5">Unable to load emails.</td></tr>';
-          }
-        }
-
         sectionLoaders['invoices-all'] = loadInvoices;
         sectionLoaders['invoices-payments'] = loadPayments;
-        sectionLoaders['invoices-emails'] = loadEmails;
       })();
 
       (function () {
