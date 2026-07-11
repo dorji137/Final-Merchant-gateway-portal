@@ -1926,12 +1926,9 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
     body{margin:0;font-family:Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--text)}
     .app{display:grid;grid-template-columns:270px 1fr;min-height:100vh}
     .sidebar{background:#f1f5f9;border-right:1px solid var(--line);color:#475569;padding:20px 14px;overflow:auto;display:flex;flex-direction:column}
-    .brand{display:flex;align-items:center;gap:10px;margin:2px 6px 20px}
-    .brand-icon{width:56px;height:56px;border-radius:10px;background:transparent;color:#fff;display:flex;align-items:center;justify-content:center;flex-shrink:0;overflow:hidden}
-    .brand-icon.icon-fallback{background:#0f172a}
-    .brand-icon img{width:100%;height:100%;object-fit:contain}
-    .brand-name{font-weight:800;font-size:14.5px;color:#0f172a;line-height:1.25;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:170px}
-    .brand-sub{font-size:10.5px;color:#94a3b8;letter-spacing:.5px;text-transform:uppercase}
+    .brand{display:flex;align-items:center;margin:4px 2px 22px;min-height:64px}
+    .brand-icon{width:100%;height:64px;background:transparent;display:flex;align-items:center;justify-content:flex-start;overflow:hidden}
+    .brand-icon img{max-width:100%;max-height:64px;object-fit:contain}
     .menu-group{margin:14px 0 4px}
     .menu-group-label{font-size:10.5px;font-weight:800;color:#94a3b8;letter-spacing:.6px;text-transform:uppercase;padding:0 10px;margin-bottom:6px}
     .menu-head,.menu-item{width:100%;display:flex;align-items:center;gap:10px;text-align:left;border:0;background:transparent;color:#475569;padding:9px 10px;border-radius:9px;cursor:pointer;font-size:13.5px;font-weight:600}
@@ -2077,11 +2074,7 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
   <div class="app">
     <aside class="sidebar">
       <div class="brand">
-        <div class="brand-icon icon-fallback" id="sidebarBrandIcon">${icon('store', 28)}</div>
-        <div>
-          <div class="brand-name" id="sidebarBrandName">Merchant Portal</div>
-          <div class="brand-sub">Payment Gateway</div>
-        </div>
+        <div class="brand-icon" id="sidebarBrandIcon"></div>
       </div>
 
       <div class="menu-group">
@@ -2458,23 +2451,14 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
 
       function applyMerchantBranding(name, logoUrl) {
         const merchantName = name || session.displayName || session.username || 'Merchant';
-        document.getElementById('sidebarBrandName').textContent = merchantName;
         document.getElementById('sidebarFooterName').textContent = merchantName;
         const hour = new Date().getHours();
         const period = hour < 12 ? 'Morning' : (hour < 18 ? 'Afternoon' : 'Evening');
         document.getElementById('dashGreeting').innerHTML = '<span id="dashGreetingIcon">' + iconMountain + '</span> Good ' + period;
         document.getElementById('dashWelcome').textContent = 'Welcome, ' + merchantName;
-        const brandIconEl = document.getElementById('sidebarBrandIcon');
-        if (logoUrl) {
-          brandIconEl.innerHTML = '<img src="' + logoUrl + '" alt="Logo" />';
-          brandIconEl.classList.remove('icon-fallback');
-        } else {
-          brandIconEl.innerHTML = iconStore;
-          brandIconEl.classList.add('icon-fallback');
-        }
+        document.getElementById('sidebarBrandIcon').innerHTML = logoUrl ? '<img src="' + logoUrl + '" alt="Logo" />' : '';
       }
       var iconMountain = document.getElementById('dashGreetingIcon').innerHTML;
-      var iconStore = document.getElementById('sidebarBrandIcon').innerHTML;
       applyMerchantBranding(portal.merchantName, portal.logoUrl);
       const midParts = [];
       if (portal.usdSettings && portal.usdSettings.merchantId) midParts.push('USD MID: ' + portal.usdSettings.merchantId);
@@ -2831,6 +2815,9 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
             const created = new Date(inv.createdAt).toLocaleDateString();
             const status = String(inv.status || 'pending').toLowerCase();
             const statusLabel = status.charAt(0).toUpperCase() + status.slice(1);
+            const copyBtn = (status === 'pending' && inv.paymentLinkToken)
+              ? '<button class="row-icon-btn" data-copy-invoice="' + inv.paymentLinkToken + '" title="Copy payment link">🔗</button>'
+              : '';
             const deleteBtn = status === 'pending'
               ? '<button class="row-icon-btn" data-delete-invoice="' + inv._id + '" title="Delete invoice">🗑️</button>'
               : '';
@@ -2842,7 +2829,7 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
               '<td style="padding:6px">' + amount + '</td>' +
               '<td style="padding:6px"><span class="status-pill ' + status + '">' + statusLabel + '</span></td>' +
               '<td style="padding:6px">' + (inv.username || '—') + '</td>' +
-              '<td style="padding:6px"><button class="row-icon-btn" data-view-invoice="' + inv._id + '" title="View details">👁️</button>' + deleteBtn + '</td>' +
+              '<td style="padding:6px"><button class="row-icon-btn" data-view-invoice="' + inv._id + '" title="View details">👁️</button>' + copyBtn + deleteBtn + '</td>' +
               '</tr>';
           }).join('');
         }
@@ -2894,9 +2881,22 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
           }
         }
 
+        async function copyInvoiceLink(token, btn) {
+          try {
+            await navigator.clipboard.writeText(window.location.origin + '/pay/' + token);
+            const original = btn.innerHTML;
+            btn.innerHTML = '✓';
+            setTimeout(function () { btn.innerHTML = original; }, 1200);
+          } catch (error) {
+            window.alert('Unable to copy link.');
+          }
+        }
+
         document.getElementById('allInvoicesBody').addEventListener('click', function (event) {
           const viewBtn = event.target.closest('[data-view-invoice]');
           if (viewBtn) return viewInvoiceDetails(viewBtn.getAttribute('data-view-invoice'));
+          const copyBtn = event.target.closest('[data-copy-invoice]');
+          if (copyBtn) return copyInvoiceLink(copyBtn.getAttribute('data-copy-invoice'), copyBtn);
           const deleteBtn = event.target.closest('[data-delete-invoice]');
           if (deleteBtn) return deleteInvoice(deleteBtn.getAttribute('data-delete-invoice'));
         });
