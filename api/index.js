@@ -1971,10 +1971,13 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
     .date-range-option:hover{background:#f1f5f9}
     .date-range-option.active{color:var(--brand1);background:#f1f5f9}
     .bell-panel{width:300px;max-height:340px;overflow:auto}
-    .bell-panel-head{padding:12px 14px;border-bottom:1px solid var(--line);font-weight:800;font-size:13px;color:#0f172a}
-    .bell-item{display:flex;gap:8px;padding:10px 14px;border-bottom:1px solid #f1f5f9;font-size:12.5px;color:#334155}
+    .bell-panel-head{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-bottom:1px solid var(--line);font-weight:800;font-size:13px;color:#0f172a}
+    .bell-item{display:flex;align-items:flex-start;gap:8px;padding:10px 14px;border-bottom:1px solid #f1f5f9;font-size:12.5px;color:#334155}
     .bell-item:last-child{border-bottom:0}
     .bell-item.unread{background:#f8fafc;font-weight:700}
+    .bell-item-text{flex:1}
+    .bell-item-clear{border:0;background:transparent;color:#94a3b8;cursor:pointer;font-size:12px;padding:0 0 0 4px;line-height:1;flex-shrink:0}
+    .bell-item-clear:hover{color:#dc2626}
     .bell-item .dot{width:7px;height:7px;border-radius:999px;margin-top:5px;flex-shrink:0}
     .bell-item .dot.overdue{background:#dc2626}
     .bell-item .dot.due-soon{background:#f59e0b}
@@ -2146,7 +2149,7 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
           <div class="dropdown-wrap">
             <button class="icon-btn" id="bellBtn" type="button" title="Notifications">${icon('bell', 18)}<span class="badge-dot" id="bellBadge" style="display:none">0</span></button>
             <div class="dropdown-panel bell-panel" id="bellPanel">
-              <div class="bell-panel-head">Notifications</div>
+              <div class="bell-panel-head"><span>Notifications</span><button class="link-btn" id="clearAllNotifsBtn" type="button">Clear all</button></div>
               <div id="bellPanelBody"><div class="bell-empty">Loading...</div></div>
             </div>
           </div>
@@ -2671,6 +2674,21 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
 
         let lastCreatedInvoice = null;
 
+        function resetInvoiceForm() {
+          document.getElementById('invoiceForm').reset();
+          document.getElementById('invNumberDisplay').value = '';
+          document.getElementById('invoiceMsg').textContent = '';
+          document.getElementById('invoiceResult').style.display = 'none';
+          document.getElementById('invoiceResultNumber').textContent = '';
+          document.getElementById('invoiceResultLink').value = '';
+          document.getElementById('downloadInvoicePdfLink').href = '#';
+          document.getElementById('invCustomerMessage').value = (portal.settings && portal.settings.paymentMessage) || '';
+          if (currencies.length > 1 && session.defaultCurrency && merchantIdsByCurrency[session.defaultCurrency]) {
+            invCurrencySelect.value = session.defaultCurrency;
+          }
+          lastCreatedInvoice = null;
+        }
+
         document.getElementById('invoiceForm').addEventListener('submit', async function (event) {
           event.preventDefault();
           const msg = document.getElementById('invoiceMsg');
@@ -2913,6 +2931,7 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
           if (viewBtn) return viewPaymentDetails(viewBtn.getAttribute('data-view-txn'));
         });
 
+        sectionLoaders['invoices-create'] = resetInvoiceForm;
         sectionLoaders['invoices-all'] = loadInvoices;
         sectionLoaders['invoices-payments'] = loadPayments;
       })();
@@ -3119,12 +3138,24 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
         }
 
         const NOTIF_SEEN_KEY = 'portalNotificationsSeenKeys';
+        const NOTIF_DISMISSED_KEY = 'portalNotificationsDismissedKeys';
         function notificationKey(item) { return item.type + ':' + item.invoiceNumber; }
         function getSeenNotificationKeys() {
           try { return JSON.parse(window.localStorage.getItem(NOTIF_SEEN_KEY) || '[]'); } catch (e) { return []; }
         }
         function saveSeenNotificationKeys(keys) {
           try { window.localStorage.setItem(NOTIF_SEEN_KEY, JSON.stringify(keys)); } catch (e) { /* ignore storage errors */ }
+        }
+        function getDismissedNotificationKeys() {
+          try { return JSON.parse(window.localStorage.getItem(NOTIF_DISMISSED_KEY) || '[]'); } catch (e) { return []; }
+        }
+        function saveDismissedNotificationKeys(keys) {
+          try { window.localStorage.setItem(NOTIF_DISMISSED_KEY, JSON.stringify(keys)); } catch (e) { /* ignore storage errors */ }
+        }
+        function dismissNotifications(keysToDismiss) {
+          const dismissed = getDismissedNotificationKeys();
+          keysToDismiss.forEach(function (k) { if (dismissed.indexOf(k) === -1) dismissed.push(k); });
+          saveDismissedNotificationKeys(dismissed);
         }
 
         async function loadNotifications(markSeen) {
@@ -3134,7 +3165,13 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
             const res = await fetch('/api/notifications', { headers: { 'Accept': 'application/json' } });
             const data = await res.json().catch(function () { return {}; });
             if (!res.ok) throw new Error(data.error || 'Unable to load notifications.');
-            const items = data.items || [];
+            const allItems = data.items || [];
+            const allKeys = allItems.map(notificationKey);
+
+            const dismissedBefore = getDismissedNotificationKeys().filter(function (k) { return allKeys.indexOf(k) !== -1; });
+            saveDismissedNotificationKeys(dismissedBefore);
+            const items = allItems.filter(function (item) { return dismissedBefore.indexOf(notificationKey(item)) === -1; });
+
             const currentKeys = items.map(notificationKey);
             const seenBefore = getSeenNotificationKeys().filter(function (k) { return currentKeys.indexOf(k) !== -1; });
 
@@ -3146,8 +3183,13 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
             }
 
             body.innerHTML = items.map(function (item) {
-              const isUnread = seenBefore.indexOf(notificationKey(item)) === -1;
-              return '<div class="bell-item' + (isUnread ? ' unread' : '') + '"><span class="dot ' + item.type + '"></span><div>' + item.message + '</div></div>';
+              const key = notificationKey(item);
+              const isUnread = seenBefore.indexOf(key) === -1;
+              return '<div class="bell-item' + (isUnread ? ' unread' : '') + '">' +
+                '<span class="dot ' + item.type + '"></span>' +
+                '<div class="bell-item-text">' + item.message + '</div>' +
+                '<button class="bell-item-clear" data-clear-notif="' + key + '" title="Clear">✕</button>' +
+                '</div>';
             }).join('');
 
             if (markSeen) {
@@ -3162,6 +3204,21 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
             body.innerHTML = '<div class="bell-empty">Unable to load notifications.</div>';
           }
         }
+
+        document.getElementById('bellPanelBody').addEventListener('click', function (event) {
+          const clearBtn = event.target.closest('[data-clear-notif]');
+          if (!clearBtn) return;
+          dismissNotifications([clearBtn.getAttribute('data-clear-notif')]);
+          loadNotifications(true);
+        });
+
+        document.getElementById('clearAllNotifsBtn').addEventListener('click', function () {
+          const keys = Array.from(document.querySelectorAll('#bellPanelBody [data-clear-notif]')).map(function (el) {
+            return el.getAttribute('data-clear-notif');
+          });
+          dismissNotifications(keys);
+          loadNotifications(true);
+        });
 
         function escapeHtmlLocal(value) {
           return String(value == null ? '' : value).replace(/[&<>"']/g, function (c) {
