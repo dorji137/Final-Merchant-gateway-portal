@@ -22,6 +22,7 @@ const ENABLE_MKREQ_MAC = process.env.ENABLE_MKREQ_MAC === 'true';
 const TEMP_DIR = process.env.VERCEL ? '/tmp' : path.join(os.tmpdir(), 'cardzone-backend');
 const PAYMENT_LINK_TTL_MS = Number(process.env.PAYMENT_LINK_TTL_MS || 30 * 60 * 1000);
 const INVOICE_DEFAULT_DUE_MS = Number(process.env.INVOICE_DEFAULT_DUE_MS || 7 * 24 * 60 * 60 * 1000);
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 12 * 60 * 60 * 1000);
 
 const txStore = new Map();
@@ -133,6 +134,37 @@ async function listTransactionsForUsername(username) {
 async function deleteInvoiceById(invoiceNumber) {
   const db = await getMongoDb();
   await db.collection('invoices').deleteOne({ _id: invoiceNumber });
+}
+
+async function saveEmailLog(record) {
+  const db = await getMongoDb();
+  await db.collection('emailLogs').insertOne(record);
+}
+
+async function listEmailLogsForUsername(username) {
+  const db = await getMongoDb();
+  return db.collection('emailLogs').find({ username }).sort({ sentAt: -1 }).toArray();
+}
+
+async function sendResendEmail({ from, to, subject, html }) {
+  if (!RESEND_API_KEY) {
+    throw new Error('Email sending is not configured (RESEND_API_KEY missing).');
+  }
+
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ from, to, subject, html }),
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data?.message || `Resend request failed with HTTP ${res.status}`);
+  }
+  return data;
 }
 
 function getRequestBaseUrl(req) {
@@ -2100,7 +2132,17 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
         </div>
       </section>
 
-      <section class="section" id="invoices-emails"><div class="card"><h3>View Emails Sent</h3><div class="card-body muted">Coming in the next phase.</div></div></section>
+      <section class="section" id="invoices-emails">
+        <div class="card">
+          <h3>View Emails Sent</h3>
+          <div class="card-body">
+            <table style="width:100%;border-collapse:collapse;font-size:13px">
+              <thead><tr style="text-align:left;border-bottom:1px solid var(--line)"><th style="padding:6px">Invoice #</th><th style="padding:6px">To</th><th style="padding:6px">From</th><th style="padding:6px">Status</th><th style="padding:6px">Sent</th></tr></thead>
+              <tbody id="emailsTableBody"><tr><td class="muted" style="padding:6px" colspan="5">Loading...</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
 
       <section class="section" id="account-password">
         <div class="card">
@@ -2482,8 +2524,28 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
           document.getElementById('emailInvoicePanel').style.display = 'block';
         });
 
-        document.getElementById('sendInvoiceEmailBtn').addEventListener('click', function () {
-          document.getElementById('emailInvoiceMsg').textContent = 'Email sending is not connected yet — coming in a later phase.';
+        document.getElementById('sendInvoiceEmailBtn').addEventListener('click', async function () {
+          if (!lastCreatedInvoice) return;
+          const msg = document.getElementById('emailInvoiceMsg');
+          const toEmail = document.getElementById('emailInvoiceTo').value.trim();
+          const message = document.getElementById('emailInvoiceMessage').value.trim();
+          if (!toEmail) {
+            msg.textContent = 'Enter a recipient email address.';
+            return;
+          }
+          msg.textContent = 'Sending...';
+          try {
+            const res = await fetch('/api/invoices/' + encodeURIComponent(lastCreatedInvoice._id) + '/send-email', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ to: toEmail, message: message })
+            });
+            const data = await res.json().catch(function () { return {}; });
+            if (!res.ok) throw new Error(data.error || 'Unable to send email.');
+            msg.textContent = 'Email sent to ' + toEmail + '.';
+          } catch (error) {
+            msg.textContent = error.message || 'Error sending email.';
+          }
         });
 
         let invoicesCache = [];
@@ -2667,8 +2729,35 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
           if (viewBtn) return viewPaymentDetails(viewBtn.getAttribute('data-view-txn'));
         });
 
+        async function loadEmails() {
+          const tbody = document.getElementById('emailsTableBody');
+          try {
+            const res = await fetch('/api/emails', { headers: { 'Accept': 'application/json' } });
+            const data = await res.json().catch(function () { return {}; });
+            const emails = data.emails || [];
+            if (!emails.length) {
+              tbody.innerHTML = '<tr><td class="muted" style="padding:6px" colspan="5">No emails sent yet.</td></tr>';
+              return;
+            }
+            tbody.innerHTML = emails.map(function (e) {
+              const status = String(e.status || '').toLowerCase();
+              const statusLabel = status.charAt(0).toUpperCase() + status.slice(1);
+              return '<tr style="border-top:1px solid #e2e8f0">' +
+                '<td style="padding:6px">' + e.invoiceNumber + '</td>' +
+                '<td style="padding:6px">' + e.to + '</td>' +
+                '<td style="padding:6px">' + e.from + '</td>' +
+                '<td style="padding:6px"><span class="status-pill ' + (status === 'sent' ? 'paid' : 'failed') + '">' + statusLabel + '</span></td>' +
+                '<td style="padding:6px">' + new Date(e.sentAt).toLocaleString() + '</td>' +
+                '</tr>';
+            }).join('');
+          } catch (error) {
+            tbody.innerHTML = '<tr><td class="muted" style="padding:6px" colspan="5">Unable to load emails.</td></tr>';
+          }
+        }
+
         sectionLoaders['invoices-all'] = loadInvoices;
         sectionLoaders['invoices-payments'] = loadPayments;
+        sectionLoaders['invoices-emails'] = loadEmails;
       })();
 
       (function () {
@@ -3962,6 +4051,92 @@ async function handleListTransactions(req, res) {
   return json(res, 200, { transactions });
 }
 
+async function handleSendInvoiceEmail(req, res, invoiceNumber) {
+  const session = getAuthenticatedSession(req);
+  if (!session) return json(res, 401, { error: 'Login required' });
+
+  const invoice = await getInvoice(invoiceNumber);
+  if (!invoice || invoice.username !== session.username) {
+    return json(res, 404, { error: 'Invoice not found' });
+  }
+
+  const raw = await parseBody(req);
+  const contentType = (req.headers['content-type'] || '').toLowerCase();
+  const input = parseRawPayload(raw, contentType);
+  const toEmail = String(input.to || '').trim();
+  const message = String(input.message || '').trim();
+
+  if (!toEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(toEmail)) {
+    return json(res, 400, { error: 'A valid recipient email is required' });
+  }
+
+  const portalDb = await loadMerchantPortalDb();
+  const merchantProfile = portalDb[session.username] || null;
+  const fromEmail = String(merchantProfile?.email || '').trim();
+
+  if (!fromEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(fromEmail)) {
+    return json(res, 400, { error: 'Set an email address in your Merchant Profile before sending invoice emails.' });
+  }
+
+  const CURRENCY_NAMES = { '840': 'USD', '356': 'INR', '064': 'BTN' };
+  const currencyLabel = CURRENCY_NAMES[invoice.currency] || invoice.currency;
+  const amountFormatted = `${currencyLabel} ${Number.parseFloat(invoice.amount || 0).toFixed(2)}`;
+  const baseUrl = getRequestBaseUrl(req);
+  const paymentUrl = `${baseUrl}/pay/${encodeURIComponent(invoice.paymentLinkToken)}`;
+  const merchantName = invoice.merchantName || session.username;
+
+  const emailHtml = `
+    <div style="font-family:Segoe UI,Arial,sans-serif;max-width:520px;margin:0 auto">
+      <h2 style="color:#2f7a3d;margin-bottom:4px">${escapeHtml(merchantName)}</h2>
+      <p>Dear ${escapeHtml(invoice.customerName || 'Customer')},</p>
+      <p>${escapeHtml(merchantName)} has sent you an invoice for <strong>${escapeHtml(amountFormatted)}</strong>.</p>
+      ${message ? `<p>${escapeHtml(message)}</p>` : ''}
+      <table style="width:100%;border-collapse:collapse;margin:16px 0;font-size:13px">
+        <tr><td style="padding:6px;color:#64748b">Invoice #</td><td style="padding:6px;font-weight:700">${escapeHtml(invoice._id)}</td></tr>
+        <tr><td style="padding:6px;color:#64748b">Amount</td><td style="padding:6px;font-weight:700">${escapeHtml(amountFormatted)}</td></tr>
+      </table>
+      <p><a href="${escapeHtml(paymentUrl)}" style="display:inline-block;background:#22c55e;color:#fff;padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:700">Pay Invoice</a></p>
+      <p style="color:#94a3b8;font-size:12px">If the button doesn't work, copy this link: ${escapeHtml(paymentUrl)}</p>
+    </div>
+  `;
+
+  const logEntry = {
+    invoiceNumber: invoice._id,
+    username: session.username,
+    to: toEmail,
+    from: fromEmail,
+    subject: `Invoice ${invoice._id} from ${merchantName}`,
+    sentAt: new Date().toISOString(),
+    status: 'pending',
+    error: null,
+  };
+
+  try {
+    await sendResendEmail({
+      from: `${merchantName} <${fromEmail}>`,
+      to: toEmail,
+      subject: logEntry.subject,
+      html: emailHtml,
+    });
+    logEntry.status = 'sent';
+    await saveEmailLog(logEntry);
+    return json(res, 200, { ok: true });
+  } catch (error) {
+    logEntry.status = 'failed';
+    logEntry.error = error.message;
+    await saveEmailLog(logEntry);
+    return json(res, 502, { error: error.message });
+  }
+}
+
+async function handleListEmailLogs(req, res) {
+  const session = getAuthenticatedSession(req);
+  if (!session) return json(res, 401, { error: 'Login required' });
+
+  const emails = await listEmailLogsForUsername(session.username);
+  return json(res, 200, { emails });
+}
+
 async function handleDownloadTransactionPdf(req, res, txnId) {
   const session = getAuthenticatedSession(req);
   if (!session) return json(res, 401, { error: 'Login required' });
@@ -4360,6 +4535,16 @@ module.exports = async function handler(req, res) {
 
     if (req.method === 'GET' && u.pathname === '/api/dashboard-summary') {
       return await handleDashboardSummary(req, res);
+    }
+
+    if (req.method === 'POST' && /^\/api\/invoices\/[^/]+\/send-email$/.test(u.pathname)) {
+      const parts = u.pathname.split('/').filter(Boolean);
+      const invoiceNumber = decodeURIComponent(parts[2] || '');
+      return await handleSendInvoiceEmail(req, res, invoiceNumber);
+    }
+
+    if (req.method === 'GET' && u.pathname === '/api/emails') {
+      return await handleListEmailLogs(req, res);
     }
 
     if (req.method === 'GET' && (u.pathname === '/api/merchant-currency' || u.pathname === '/merchant-currency')) {
