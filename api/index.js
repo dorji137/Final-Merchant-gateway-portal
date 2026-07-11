@@ -1940,9 +1940,9 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
 
     <main class="content">
       <div class="topbar">
-        <div>
-          <h1 class="title">Welcome, <span id="welcomeName"></span></h1>
-          <p class="subtitle">Create and track invoices, and manage your merchant profile from one place.</p>
+        <div class="dash-header">
+          <img id="dashLogo" class="logo" alt="Merchant Logo" style="display:none" />
+          <h1 class="title" id="dashWelcome" style="margin:0"></h1>
         </div>
         <div class="actions">
           <button class="btn primary" id="topbarLogoutBtn">Logout</button>
@@ -1950,15 +1950,7 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
       </div>
 
       <section class="section active" id="dashboard">
-        <div class="dash-header">
-          <img id="dashLogo" class="logo" alt="Merchant Logo" style="display:none" />
-          <div>
-            <h2 id="dashWelcome" style="margin:0;font-size:22px"></h2>
-            <div class="muted" style="font-size:12.5px;margin-top:2px">Here's how your business is doing</div>
-          </div>
-        </div>
-
-        <div class="grid" style="margin-top:16px">
+        <div class="grid" style="margin-top:0">
           <article class="card col-3"><div class="card-body stat-tile"><div class="stat-label">Total Revenue</div><div class="stat-value" id="statRevenue">—</div></div></article>
           <article class="card col-3"><div class="card-body stat-tile"><div class="stat-label">Paid</div><div class="stat-value good" id="statPaid">—</div></div></article>
           <article class="card col-3"><div class="card-body stat-tile"><div class="stat-label">Pending</div><div class="stat-value warn" id="statPending">—</div></div></article>
@@ -1990,16 +1982,6 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
             <div class="card-body" id="gatewayStatusBody">Loading...</div>
           </article>
         </div>
-
-        <article class="card" style="margin-top:14px">
-          <h3>Quick Actions</h3>
-          <div class="card-body" style="display:flex;gap:10px;flex-wrap:wrap">
-            <button class="btn primary" type="button" data-quick-nav="invoices-create">Create Invoice</button>
-            <button class="btn" type="button" data-quick-nav="invoices-all">View All Invoices</button>
-            <button class="btn" type="button" data-quick-nav="merchant-profile">Edit Merchant Profile</button>
-            <button class="btn" type="button" data-quick-nav="account-password">Change Password</button>
-          </div>
-        </article>
       </section>
 
       <section class="section" id="merchant-profile">
@@ -2265,7 +2247,6 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
         };
       }
 
-      document.getElementById('welcomeName').textContent = session.displayName || session.username || 'Merchant';
       document.getElementById('dashWelcome').textContent = 'Welcome, ' + (portal.merchantName || session.displayName || session.username || 'Merchant');
       if (portal.logoUrl) {
         document.getElementById('dashLogo').src = portal.logoUrl;
@@ -2283,16 +2264,23 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
         });
       }
 
+      var sectionLoaders = {};
+
+      function activateSection(id) {
+        showSection(id);
+        if (sectionLoaders[id]) sectionLoaders[id]();
+      }
+
       document.querySelectorAll('.nav-btn').forEach(function (btn) {
         btn.addEventListener('click', function () {
           const target = btn.getAttribute('data-target');
-          if (target) showSection(target);
+          if (target) activateSection(target);
         });
       });
 
       document.body.addEventListener('click', function (event) {
         const quickNavBtn = event.target.closest('[data-quick-nav]');
-        if (quickNavBtn) showSection(quickNavBtn.getAttribute('data-quick-nav'));
+        if (quickNavBtn) activateSection(quickNavBtn.getAttribute('data-quick-nav'));
       });
 
       async function performLogout() {
@@ -2679,10 +2667,8 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
           if (viewBtn) return viewPaymentDetails(viewBtn.getAttribute('data-view-txn'));
         });
 
-        const allInvoicesBtn = document.querySelector('[data-target="invoices-all"]');
-        const paidInvoicesBtn = document.querySelector('[data-target="invoices-payments"]');
-        if (allInvoicesBtn) allInvoicesBtn.addEventListener('click', loadInvoices);
-        if (paidInvoicesBtn) paidInvoicesBtn.addEventListener('click', loadPayments);
+        sectionLoaders['invoices-all'] = loadInvoices;
+        sectionLoaders['invoices-payments'] = loadPayments;
       })();
 
       (function () {
@@ -4018,7 +4004,7 @@ async function handleDashboardSummary(req, res) {
     ? Math.round((paid.length / (paid.length + failed.length)) * 1000) / 10
     : 0;
 
-  const seriesCurrency = normalizeCurrency(session.defaultCurrency) || Object.keys(totalRevenueByCurrency)[0] || '';
+  const seriesCurrency = Object.keys(totalRevenueByCurrency)[0] || normalizeCurrency(session.defaultCurrency) || '';
   const now = new Date();
   const days = [];
   for (let i = 29; i >= 0; i--) {
@@ -4169,10 +4155,10 @@ function renderInvoiceReviewPage(invoice, merchantProfile, hiddenFields) {
 
         <form id="payForm" method="post" action="/api/initiate">${inputs}
           <label class="agree">
-            <input type="checkbox" id="agreeBox" ${hasTerms ? '' : 'checked style="display:none"'} />
+            <input type="checkbox" id="agreeBox" />
             <span>I agree to the ${hasTerms ? `<a id="termsLink">Terms and Conditions</a>` : 'Terms and Conditions'} of ${escapeHtml(merchantName)}</span>
           </label>
-          <button type="submit" id="proceedBtn" class="continue-btn" ${hasTerms ? 'disabled' : ''}>Continue</button>
+          <button type="submit" id="proceedBtn" class="continue-btn" disabled>Continue</button>
         </form>
         <div class="disclaimer">
           <p>&#9888; Make sure you confirm that the payment details are correct before proceeding.</p>
