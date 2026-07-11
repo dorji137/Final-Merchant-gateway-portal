@@ -4,6 +4,7 @@ const fs = require('fs').promises;
 const path = require('path');
 const os = require('os');
 const PDFDocument = require('pdfkit');
+const { MongoClient } = require('mongodb');
 
 const MERCHANT_ID_DEFAULT = process.env.MERCHANT_ID || '863990030700270';
 const CARDZONE_MKREQ_URL = process.env.CARDZONE_MKREQ_URL || 'https://3dsecure.bob.bt/3dss/mkReq';
@@ -15,13 +16,105 @@ const CARDZONE_INQUIRY_URL =
   process.env.CARDZONE_INQUIRY_URL ||
   '';
 const CARDZONE_PROFILE_URL = process.env.CARDZONE_PROFILE_URL || '';
-const MERCHANT_CURRENCY_DB_PATH =
-  process.env.MERCHANT_CURRENCY_DB_PATH || path.join(process.cwd(), 'data', 'merchant-currency.json');
+const MONGODB_URI = process.env.MONGODB_URI || '';
+const MONGODB_DB_NAME = process.env.MONGODB_DB_NAME || 'nanodb';
 const ENABLE_MKREQ_MAC = process.env.ENABLE_MKREQ_MAC === 'true';
 const TEMP_DIR = process.env.VERCEL ? '/tmp' : path.join(os.tmpdir(), 'cardzone-backend');
 const PAYMENT_LINK_TTL_MS = Number(process.env.PAYMENT_LINK_TTL_MS || 30 * 60 * 1000);
+const INVOICE_DEFAULT_DUE_MS = Number(process.env.INVOICE_DEFAULT_DUE_MS || 7 * 24 * 60 * 60 * 1000);
+const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 12 * 60 * 60 * 1000);
 
 const txStore = new Map();
+const sessionStore = new Map();
+
+let mongoClientPromise = null;
+
+async function getMongoDb() {
+  if (!MONGODB_URI) throw new Error('MONGODB_URI is not configured');
+  if (!mongoClientPromise) {
+    const client = new MongoClient(MONGODB_URI);
+    mongoClientPromise = client.connect().catch((err) => {
+      mongoClientPromise = null;
+      throw err;
+    });
+  }
+  const client = await mongoClientPromise;
+  return client.db(MONGODB_DB_NAME);
+}
+
+async function replaceCollectionContents(collectionName, obj) {
+  const db = await getMongoDb();
+  const coll = db.collection(collectionName);
+  const keys = Object.keys(obj);
+
+  if (keys.length) {
+    const ops = keys.map((key) => ({
+      replaceOne: {
+        filter: { _id: key },
+        replacement: { _id: key, ...obj[key] },
+        upsert: true,
+      },
+    }));
+    await coll.bulkWrite(ops);
+    await coll.deleteMany({ _id: { $nin: keys } });
+  } else {
+    await coll.deleteMany({});
+  }
+}
+
+async function readCollectionAsObject(collectionName) {
+  const db = await getMongoDb();
+  const docs = await db.collection(collectionName).find({}).toArray();
+  const out = {};
+  for (const doc of docs) {
+    const { _id, ...rest } = doc;
+    out[_id] = rest;
+  }
+  return out;
+}
+
+async function nextInvoiceNumber() {
+  const db = await getMongoDb();
+  const result = await db.collection('counters').findOneAndUpdate(
+    { _id: 'invoiceNumber' },
+    { $inc: { seq: 1 } },
+    { upsert: true, returnDocument: 'after' }
+  );
+  const seq = result?.seq ?? result?.value?.seq ?? 1;
+  return `INV-${String(seq).padStart(6, '0')}`;
+}
+
+async function saveInvoice(invoice) {
+  const db = await getMongoDb();
+  await db.collection('invoices').replaceOne({ _id: invoice._id }, invoice, { upsert: true });
+}
+
+async function getInvoice(invoiceNumber) {
+  const id = String(invoiceNumber || '').trim();
+  if (!id) return null;
+  const db = await getMongoDb();
+  return db.collection('invoices').findOne({ _id: id });
+}
+
+async function listInvoicesForUsername(username, statusFilter) {
+  const db = await getMongoDb();
+  const query = { username };
+  if (statusFilter) query.status = statusFilter;
+  return db.collection('invoices').find(query).sort({ createdAt: -1 }).toArray();
+}
+
+async function updateInvoiceStatus(invoiceNumber, status) {
+  const db = await getMongoDb();
+  await db.collection('invoices').updateOne(
+    { _id: invoiceNumber },
+    { $set: { status, updatedAt: new Date().toISOString() } }
+  );
+}
+
+async function saveTransactionHistory(record) {
+  const db = await getMongoDb();
+  await db.collection('transactions').replaceOne({ _id: record._id }, record, { upsert: true });
+}
 
 function getRequestBaseUrl(req) {
   if (process.env.CALLBACK_BASE_URL) return process.env.CALLBACK_BASE_URL;
@@ -189,18 +282,287 @@ function normalizeMerchantId(value) {
   return String(value || '').replace(/\D/g, '');
 }
 
+function parseCookies(req) {
+  const header = String(req.headers.cookie || '');
+  const out = {};
+  if (!header) return out;
+
+  const parts = header.split(';');
+  for (const part of parts) {
+    const idx = part.indexOf('=');
+    if (idx <= 0) continue;
+    const key = part.slice(0, idx).trim();
+    const val = part.slice(idx + 1).trim();
+    if (!key) continue;
+    out[key] = decodeURIComponent(val);
+  }
+  return out;
+}
+
+function getSessionTokenFromRequest(req) {
+  const cookies = parseCookies(req);
+  return String(cookies.portalSession || '').trim();
+}
+
+function cleanupExpiredSessions() {
+  const now = Date.now();
+  for (const [token, session] of sessionStore.entries()) {
+    if (!session?.expiresAt || Date.parse(session.expiresAt) <= now) {
+      sessionStore.delete(token);
+    }
+  }
+}
+
+function getAuthenticatedSession(req) {
+  cleanupExpiredSessions();
+  const token = getSessionTokenFromRequest(req);
+  if (!token) return null;
+  const session = sessionStore.get(token);
+  if (!session) return null;
+  if (!session.expiresAt || Date.parse(session.expiresAt) <= Date.now()) {
+    sessionStore.delete(token);
+    return null;
+  }
+  return session;
+}
+
+function setSessionCookie(res, token, maxAgeSeconds) {
+  res.setHeader(
+    'Set-Cookie',
+    `portalSession=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}`
+  );
+}
+
+function clearSessionCookie(res) {
+  res.setHeader('Set-Cookie', 'portalSession=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
+}
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(String(password), salt, 64).toString('hex');
+  return { hash, salt };
+}
+
+function verifyPassword(password, hash, salt) {
+  if (!hash || !salt) return false;
+  try {
+    const candidate = crypto.scryptSync(String(password), salt, 64);
+    const expected = Buffer.from(hash, 'hex');
+    if (candidate.length !== expected.length) return false;
+    return crypto.timingSafeEqual(candidate, expected);
+  } catch {
+    return false;
+  }
+}
+
+async function loadMerchantUserDbRaw() {
+  try {
+    return await readCollectionAsObject('merchantUsers');
+  } catch {
+    return {};
+  }
+}
+
+async function saveMerchantUserDbRaw(usersObj) {
+  await replaceCollectionContents('merchantUsers', usersObj);
+}
+
+async function saveMerchantPortalDb(portalObj) {
+  await replaceCollectionContents('merchantPortalProfiles', portalObj);
+}
+
+function findUsernameKey(usersObj, username) {
+  const target = String(username || '').trim().toLowerCase();
+  if (!target) return null;
+  return Object.keys(usersObj).find(key => key.toLowerCase() === target) || null;
+}
+
+const LOGO_DATA_URL_RE = /^data:image\/(png|jpe?g|gif|webp|svg\+xml);base64,[a-z0-9+/]+=*$/i;
+const LOGO_MAX_CHARS = 1_500_000;
+
+function validateLogoUrl(logoUrl) {
+  if (!logoUrl) return null;
+  if (logoUrl.length > LOGO_MAX_CHARS) {
+    return 'Logo image is too large (max ~1MB). Please use a smaller image.';
+  }
+  if (/^https?:\/\//i.test(logoUrl)) return null;
+  if (LOGO_DATA_URL_RE.test(logoUrl)) return null;
+  return 'Logo must be an http(s) URL or an uploaded image file';
+}
+
+async function loadMerchantUserDb() {
+  const users = await loadMerchantUserDbRaw();
+  const out = new Map();
+
+  for (const [usernameRaw, userDef] of Object.entries(users)) {
+    const username = String(usernameRaw || '').trim();
+    if (!username || !userDef || typeof userDef !== 'object') continue;
+
+    const passwordHash = String(userDef.passwordHash || '').trim();
+    const passwordSalt = String(userDef.passwordSalt || '').trim();
+    if (!passwordHash || !passwordSalt) continue;
+
+    const merchantIdsByCurrency = {};
+    const inputMap = userDef.merchantIdsByCurrency;
+    if (inputMap && typeof inputMap === 'object' && !Array.isArray(inputMap)) {
+      for (const [currencyRaw, midRaw] of Object.entries(inputMap)) {
+        const currency = normalizeCurrency(currencyRaw);
+        const merchantId = normalizeMerchantId(midRaw);
+        if (currency && merchantId) merchantIdsByCurrency[currency] = merchantId;
+      }
+    }
+
+    const fallbackMerchantId = normalizeMerchantId(userDef.merchantId);
+    const defaultCurrency = normalizeCurrency(userDef.defaultCurrency);
+    const displayName = String(userDef.displayName || username).trim() || username;
+    const role = String(userDef.role || 'merchant').trim().toLowerCase() === 'developer' ? 'developer' : 'merchant';
+
+    out.set(username.toLowerCase(), {
+      username,
+      passwordHash,
+      passwordSalt,
+      displayName,
+      role,
+      merchantId: fallbackMerchantId,
+      merchantIdsByCurrency,
+      defaultCurrency,
+    });
+  }
+
+  return out;
+}
+
+function getSessionMerchantRouting(session, requestedCurrency = '') {
+  const map = session?.merchantIdsByCurrency && typeof session.merchantIdsByCurrency === 'object'
+    ? session.merchantIdsByCurrency
+    : {};
+  const supportedCurrencies = Object.keys(map).filter(code => normalizeCurrency(code));
+  const preferredCurrency = normalizeCurrency(requestedCurrency);
+
+  if (preferredCurrency && map[preferredCurrency]) {
+    return { merchantId: map[preferredCurrency], currency: preferredCurrency, source: 'session-currency-map' };
+  }
+
+  const defaultCurrency = normalizeCurrency(session?.defaultCurrency);
+  if (defaultCurrency && map[defaultCurrency]) {
+    return { merchantId: map[defaultCurrency], currency: defaultCurrency, source: 'session-default-currency' };
+  }
+
+  if (supportedCurrencies.length) {
+    const currency = supportedCurrencies[0];
+    return { merchantId: map[currency], currency, source: 'session-first-currency' };
+  }
+
+  const merchantId = normalizeMerchantId(session?.merchantId);
+  if (merchantId) {
+    return { merchantId, currency: '', source: 'session-single-mid' };
+  }
+
+  return null;
+}
+
+function buildSessionClientView(session) {
+  const routing = getSessionMerchantRouting(session);
+  const currencyMap = session?.merchantIdsByCurrency && typeof session.merchantIdsByCurrency === 'object'
+    ? session.merchantIdsByCurrency
+    : {};
+  const supportedCurrencies = Object.keys(currencyMap).filter(code => normalizeCurrency(code));
+
+  return {
+    username: String(session?.username || ''),
+    displayName: String(session?.displayName || session?.username || ''),
+    role: session?.role === 'developer' ? 'developer' : 'merchant',
+    merchantId: routing?.merchantId || '',
+    defaultCurrency: routing?.currency || '',
+    merchantIdsByCurrency: currencyMap,
+    supportedCurrencies,
+  };
+}
+
+async function loadMerchantPortalDb() {
+  try {
+    return await readCollectionAsObject('merchantPortalProfiles');
+  } catch {
+    return {};
+  }
+}
+
+function buildDefaultPortalModel(sessionView = {}) {
+  const currencyMap = sessionView?.merchantIdsByCurrency && typeof sessionView.merchantIdsByCurrency === 'object'
+    ? sessionView.merchantIdsByCurrency
+    : {};
+
+  return {
+    merchantName: sessionView.displayName || sessionView.username || 'Merchant',
+    logoUrl: '',
+    address: '',
+    email: '',
+    phone: '',
+    usdSettings: {
+      merchantId: currencyMap['840'] || '',
+      secretKey: '',
+      keyVersion: '',
+    },
+    inrSettings: {
+      merchantId: currencyMap['356'] || '',
+      secretKey: '',
+      keyVersion: '',
+    },
+    settings: {
+      useCustomerNames: true,
+      sendInvoiceViaEmail: true,
+      allowExternalPayments: true,
+      paymentMessage: 'Thank you for your payment.',
+      successfulPaymentMessage: 'Payment completed successfully.',
+      termsAndConditions: 'All payments are final unless otherwise specified in your contract.',
+    },
+  };
+}
+
+function mergePortalModel(defaultModel, customModel) {
+  const source = customModel && typeof customModel === 'object' ? customModel : {};
+  const usd = source.usdSettings && typeof source.usdSettings === 'object' ? source.usdSettings : {};
+  const inr = source.inrSettings && typeof source.inrSettings === 'object' ? source.inrSettings : {};
+  const settings = source.settings && typeof source.settings === 'object' ? source.settings : {};
+
+  return {
+    ...defaultModel,
+    ...source,
+    usdSettings: {
+      ...defaultModel.usdSettings,
+      ...usd,
+    },
+    inrSettings: {
+      ...defaultModel.inrSettings,
+      ...inr,
+    },
+    settings: {
+      ...defaultModel.settings,
+      ...settings,
+    },
+  };
+}
+
+async function getPortalModelForSession(sessionView) {
+  const db = await loadMerchantPortalDb();
+  const usernameKey = String(sessionView?.username || '').trim();
+  const displayKey = String(sessionView?.displayName || '').trim();
+
+  const defaultModel = buildDefaultPortalModel(sessionView);
+  const customModel = db[usernameKey] || db[displayKey] || null;
+  return mergePortalModel(defaultModel, customModel);
+}
+
 async function loadMerchantCurrencyDb() {
   try {
-    const raw = await fs.readFile(MERCHANT_CURRENCY_DB_PATH, 'utf8');
-    const parsed = JSON.parse(raw || '{}');
+    const db = await getMongoDb();
+    const docs = await db.collection('merchantCurrencyWhitelist').find({}).toArray();
     const map = new Map();
 
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      for (const [mid, curr] of Object.entries(parsed)) {
-        const id = normalizeMerchantId(mid);
-        const code = normalizeCurrency(curr);
-        if (id && code) map.set(id, code);
-      }
+    for (const doc of docs) {
+      const id = normalizeMerchantId(doc._id);
+      const code = normalizeCurrency(doc.currency);
+      if (id && code) map.set(id, code);
     }
 
     return map;
@@ -799,7 +1161,7 @@ function renderMessagePage(title, message, details) {
 </html>`;
 }
 
-function renderResultPage(tx, paymentStatus, finalResult, homeUrl = '/') {
+function renderResultPage(tx, paymentStatus, finalResult, homeUrl = '/', customSuccessMessage = '') {
   const isSuccess = paymentStatus === 'SUCCESS';
   const isPaymentLinkFlow = tx?.initiationSource === 'payment-link' || !!tx?.paymentLinkToken;
   const responseCode = finalResult?.responseCode || '';
@@ -970,6 +1332,7 @@ function renderResultPage(tx, paymentStatus, finalResult, homeUrl = '/') {
         </div>
       </div>
       <div class="body">
+        ${isSuccess && customSuccessMessage ? `<div style="margin-bottom:16px;padding:12px;border-radius:10px;background:#ecfdf5;border:1px solid #6ee7b7;color:#065f46;font-size:13.5px">${escapeHtml(customSuccessMessage)}</div>` : ''}
         <div class="sec-title">Transaction Details</div>
         <table>${tableRows}</table>
       </div>
@@ -1072,6 +1435,81 @@ async function generateReceiptPdfBuffer(tx, paymentStatus, finalResult) {
   });
 }
 
+async function generateInvoicePdfBuffer(invoice) {
+  const CURRENCY_NAMES = {
+    '840': 'USD', '356': 'INR', '064': 'BTN', '524': 'NPR', '144': 'LKR',
+    '586': 'PKR', '050': 'BDT', '702': 'SGD', '978': 'EUR', '826': 'GBP',
+    '036': 'AUD', '124': 'CAD', '392': 'JPY', '156': 'CNY', '410': 'KRW',
+  };
+  const currencyDisplay = CURRENCY_NAMES[invoice.currency] || invoice.currency || '';
+  const amountFormatted = `${currencyDisplay ? `${currencyDisplay} ` : ''}${Number.parseFloat(invoice.amount || 0).toFixed(2)}`;
+
+  const fmtDate = (iso) => {
+    try {
+      return new Date(iso).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+    } catch {
+      return iso || '—';
+    }
+  };
+
+  const rows = [
+    ['Invoice Number', invoice._id],
+    ['Invoice Date', fmtDate(invoice.invoiceDate)],
+    ['Due Date', fmtDate(invoice.dueDate)],
+    ['Amount', amountFormatted],
+    ['Customer Name', invoice.customerName || '—'],
+    ['Merchant', invoice.merchantName || '—'],
+    ['Status', String(invoice.status || 'pending').toUpperCase()],
+  ];
+
+  return await new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ size: 'A4', margin: 50 });
+    const chunks = [];
+    doc.on('data', c => chunks.push(c));
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+
+    doc.fillColor('#0f2d5e').font('Helvetica-Bold').fontSize(18).text(invoice.merchantName || 'Invoice');
+    doc.moveDown(0.2);
+    doc.fillColor('#64748b').font('Helvetica').fontSize(10).text('Payment Invoice');
+    doc.moveDown(1);
+
+    doc.fillColor('#2563eb').font('Helvetica-Bold').fontSize(14).text(`Invoice ${invoice._id}`);
+    doc.moveDown(1);
+
+    const startX = doc.x;
+    let y = doc.y;
+    const labelWidth = 190;
+    const valueX = startX + labelWidth;
+    const rowGap = 8;
+
+    for (const [label, value] of rows) {
+      doc.fillColor('#64748b').font('Helvetica-Bold').fontSize(10).text(label, startX, y, { width: labelWidth - 10 });
+      doc.fillColor('#111827').font('Helvetica').fontSize(10).text(String(value || '—'), valueX, y, { width: 320 });
+      y = Math.max(doc.y, y) + rowGap;
+      doc.moveTo(startX, y - 4).lineTo(545, y - 4).strokeColor('#e5e7eb').lineWidth(0.5).stroke();
+    }
+
+    if (invoice.customerMessage) {
+      doc.moveDown(1);
+      doc.fillColor('#334155').font('Helvetica-Bold').fontSize(10).text('Message');
+      doc.fillColor('#111827').font('Helvetica').fontSize(9).text(invoice.customerMessage, { width: 495 });
+    }
+
+    if (invoice.termsAndConditions) {
+      doc.moveDown(1);
+      doc.fillColor('#334155').font('Helvetica-Bold').fontSize(10).text('Terms & Conditions');
+      doc.fillColor('#475569').font('Helvetica').fontSize(9).text(invoice.termsAndConditions, { width: 495 });
+    }
+
+    doc.moveDown(1.2);
+    doc.fillColor('#94a3b8').font('Helvetica').fontSize(9)
+      .text('This invoice was generated by the Secure Payment Gateway merchant portal.');
+
+    doc.end();
+  });
+}
+
 async function handleReceiptPdf(req, res) {
   const u = new URL(req.url, `http://${req.headers.host}`);
   const txnId = String(u.searchParams.get('txnId') || '').trim();
@@ -1145,427 +1583,835 @@ function renderDeveloperHome(baseUrl) {
 </html>`;
 }
 
-function renderPublicCheckoutPage(baseUrl) {
+function renderLoginPage(baseUrl, errorMessage = '') {
+  const safeError = escapeHtml(String(errorMessage || '').trim());
   return `<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Secure Payment Portal</title>
+  <title>Merchant Login</title>
   <style>
-    :root{
-      --bg:#eef3fb;
-      --card:#ffffff;
-      --text:#10213a;
-      --muted:#5f6f86;
-      --brand:#0f2d5e;
-      --brand-2:#1a4a8a;
-      --accent:#165dff;
-      --accent-2:#0e4bd4;
-      --border:#d9e3f3;
-      --ok:#0f9b63;
-      --warn:#c27a00;
-    }
+    :root{--bg:#eef3fb;--card:#fff;--text:#10213a;--muted:#5f6f86;--brand:#0f2d5e;--brand2:#1a4a8a;--accent:#165dff;--border:#d9e3f3}
     *{box-sizing:border-box}
-    body{
-      margin:0;
-      font-family:Segoe UI,Arial,sans-serif;
-      color:var(--text);
-      background:linear-gradient(180deg,#f8fbff 0%, var(--bg) 100%);
-      min-height:100vh;
-      padding:28px 14px;
-    }
-    .container{width:100%;max-width:940px;margin:0 auto}
-    .layout{display:grid;grid-template-columns:1.2fr .8fr;gap:18px}
-    .card{
-      background:var(--card);
-      border:1px solid var(--border);
-      border-radius:18px;
-      box-shadow:0 16px 40px rgba(16,33,58,.10);
-      overflow:hidden;
-    }
-    .bank-head{
-      background:linear-gradient(135deg,var(--brand) 0%,var(--brand-2) 100%);
-      padding:18px 22px;
-      color:#fff;
-      display:flex;
-      align-items:center;
-      justify-content:space-between;
-      gap:12px;
-    }
-    .bank-brand{display:flex;align-items:center;gap:10px}
-    .bank-icon{
-      width:42px;height:42px;border-radius:999px;
-      background:rgba(255,255,255,.16);
-      display:flex;align-items:center;justify-content:center;
-      font-size:20px;
-    }
-    .bank-title{font-size:17px;font-weight:700;letter-spacing:.2px}
-    .bank-sub{font-size:11.5px;opacity:.78;margin-top:2px}
-    .bank-badge{
-      font-size:11px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;
-      padding:7px 10px;border-radius:999px;background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.28)
-    }
-    .panel-body{padding:20px 22px 22px}
-    .heading{margin-bottom:14px}
-    .title{margin:0 0 5px;font-size:24px;line-height:1.2}
-    .subtitle{margin:0;color:var(--muted);font-size:13.5px}
-    .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:13px;margin-top:12px}
-    .field{display:flex;flex-direction:column;gap:6px}
-    .field.full{grid-column:1 / -1}
-    label{font-size:12.5px;color:#2c3f5f;font-weight:700}
-    input,textarea{
-      width:100%;
-      border:1px solid #cfdced;
-      background:#fff;
-      color:#10213a;
-      border-radius:10px;
-      padding:11px 12px;
-      outline:none;
-      transition:border-color .2s,box-shadow .2s;
-      font-size:13.5px;
-    }
-    textarea{resize:vertical;min-height:88px}
-    input:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(22,93,255,.12)}
-    .section-label{
-      grid-column:1 / -1;
-      margin-top:4px;
-      font-size:11px;
-      font-weight:700;
-      color:#60708c;
-      text-transform:uppercase;
-      letter-spacing:.8px;
-      padding-bottom:7px;
-      border-bottom:1px solid #e6edf8;
-    }
-    .currency-pill{
-      display:inline-flex;align-items:center;gap:6px;
-      border:1px solid #d6e2f2;background:#f6f9ff;color:#26446d;
-      border-radius:999px;padding:5px 9px;font-size:11px;font-weight:700;
-    }
-    .button-row{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}
-    .submit{
-      flex:1;
-      min-width:240px;
-      background:linear-gradient(180deg,var(--accent),var(--accent-2));
-      color:white;
-      border:0;
-      border-radius:10px;
-      padding:12px 16px;
-      font-weight:700;
-      cursor:pointer;
-    }
-    .submit:hover{filter:brightness(.98)}
-    .secondary{
-      flex:1;
-      min-width:210px;
-      background:#f0f4f9;
-      color:var(--text);
-      border:1px solid var(--border);
-      border-radius:10px;
-      padding:12px 16px;
-      font-weight:600;
-      cursor:pointer;
-      font-size:13.5px;
-    }
-    .secondary:hover{background:#e8ecf4}
-    .link-panel{display:none;margin-top:12px;border:1px solid #dbe6f5;border-radius:12px;padding:12px;background:#f8fbff}
-    .link-panel.active{display:block}
-    .link-panel h3{margin:2px 0 8px;font-size:15px}
-    .link-panel p{margin:6px 0;color:var(--muted);font-size:13px}
-    .link-output{display:flex;gap:8px;margin:10px 0}
-    .link-output input{flex:1;font-size:12px;padding:10px;border-radius:8px}
-    .link-output button{flex:0 0 auto;width:auto;margin-top:0;min-width:100px}
-    .tiny{font-size:12px;color:#8a9aad}
-
-    .side{
-      background:#fff;
-      border:1px solid var(--border);
-      border-radius:18px;
-      box-shadow:0 16px 40px rgba(16,33,58,.08);
-      padding:16px;
-      height:fit-content;
-    }
-    .side h3{margin:0 0 8px;font-size:15px;color:#17345f}
-    .side p{margin:0;color:#60708c;font-size:12.8px;line-height:1.55}
-    .trust{
-      margin-top:12px;
-      padding:12px;
-      border:1px solid #dde8f6;
-      border-radius:10px;
-      background:#f8fbff;
-    }
-    .trust ul{margin:0;padding:0;list-style:none;display:grid;gap:8px}
-    .trust li{display:flex;align-items:center;gap:8px;color:#3c4f6e;font-size:12.8px}
-    .dot{height:8px;width:8px;border-radius:999px;background:var(--ok);flex:none}
-
-    .notice{
-      margin-top:10px;
-      border:1px solid #fde6b7;
-      background:#fffbf0;
-      color:#7a5b1d;
-      padding:10px 11px;
-      border-radius:10px;
-      font-size:12px;
-      line-height:1.45;
-    }
-    .footnote{margin-top:12px;color:#8fa0ba;font-size:11px;line-height:1.45}
-
-    @media (max-width:980px){
-      .layout{grid-template-columns:1fr}
-      .side{order:2}
-    }
-    @media (max-width:900px){
-      .form-grid{grid-template-columns:1fr}
-      .button-row{flex-direction:column}
-      .submit,.secondary{min-width:0;width:100%}
-    }
+    body{margin:0;min-height:100vh;display:grid;place-items:center;background:linear-gradient(180deg,#f8fbff 0%, var(--bg) 100%);font-family:Segoe UI,Arial,sans-serif;color:var(--text);padding:20px}
+    .card{width:100%;max-width:440px;background:var(--card);border:1px solid var(--border);border-radius:16px;box-shadow:0 16px 40px rgba(16,33,58,.1);overflow:hidden}
+    .head{background:linear-gradient(135deg,var(--brand) 0%,var(--brand2) 100%);padding:18px 20px;color:#fff}
+    .head h1{margin:0;font-size:20px}
+    .head p{margin:6px 0 0;opacity:.85;font-size:12.5px}
+    .body{padding:20px}
+    label{display:block;font-size:12.5px;font-weight:700;margin:0 0 6px;color:#2c3f5f}
+    input{width:100%;border:1px solid #cfdced;border-radius:10px;padding:11px 12px;margin-bottom:12px;font-size:14px;outline:none}
+    input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(22,93,255,.12)}
+    button{width:100%;border:0;border-radius:10px;padding:12px 16px;background:linear-gradient(180deg,var(--accent),#0e4bd4);color:#fff;font-weight:700;cursor:pointer}
+    .error{margin:0 0 12px;padding:10px;border-radius:10px;background:#fff2f2;border:1px solid #ffd2d2;color:#8b2323;font-size:12.5px}
+    .tiny{margin-top:10px;color:var(--muted);font-size:12px}
   </style>
 </head>
 <body>
-  <div class="container">
-    <div class="layout">
-      <section class="card">
-        <div class="bank-head">
-          <div class="bank-brand">
-            <div class="bank-icon">&#127974;</div>
-            <div>
-              <div class="bank-title">Secure Payment Gateway</div>
-              <div class="bank-sub">Bank-grade card processing portal</div>
-            </div>
-          </div>
-          <div class="bank-badge">3D Secure</div>
-        </div>
-
-        <div class="panel-body">
-          <div class="heading">
-            <h1 class="title">Business Payment Portal</h1>
-            <p class="subtitle">Initiate card transactions through a secure hosted banking flow and receive professional digital receipts.</p>
-          </div>
-
-          <form id="checkoutForm" method="post" action="/api/initiate" autocomplete="on">
-            <div class="form-grid">
-              <div class="section-label">Payment Details</div>
-
-              <div class="field">
-                <label for="merchantId">Merchant ID</label>
-                <input id="merchantId" name="merchantId" required placeholder="Enter registered MID" />
-              </div>
-
-              <div class="field" style="position:relative">
-                <label for="amount">Amount <span id="currencyPill" class="currency-pill" style="display:none">Currency: <span id="currencyLabel"></span></span></label>
-                <input id="amount" name="amount" type="number" required min="0.01" step="0.01" placeholder="0.00" />
-              </div>
-
-              <div class="section-label">Customer Details</div>
-
-              <div class="field">
-                <label for="customerName">Customer Name</label>
-                <input id="customerName" name="customerName" placeholder="Enter customer full name" />
-              </div>
-
-              <div class="field">
-                <label for="email">Customer Email</label>
-                <input id="email" name="email" type="email" placeholder="Enter customer email" />
-              </div>
-
-              <div class="field full">
-                <label for="paymentDescription">Payment Description</label>
-                <textarea id="paymentDescription" name="paymentDescription" placeholder="Describe service or purpose of payment"></textarea>
-              </div>
-            </div>
-
-            <input id="currency" name="currency" type="hidden" value="" />
-
-            <div class="button-row">
-              <button class="submit" type="submit" id="proceedButton">Proceed to Secure Payment</button>
-              <button class="secondary" type="button" id="generateLinkButton">Generate Payment Link</button>
-            </div>
-
-            <div class="link-panel" id="paymentLinkPanel">
-              <h3>Shareable payment link</h3>
-              <p>Send this link to the cardholder. Opening it will start the secure Cardzone payment flow.</p>
-              <div class="link-output">
-                <input id="paymentLinkOutput" readonly value="" />
-                <button class="secondary" type="button" id="copyLinkButton">Copy Link</button>
-              </div>
-              <p class="tiny" id="paymentLinkMeta"></p>
-            </div>
-          </form>
-
-          <div class="notice">
-            Use only registered merchant details. After payment completion, a professional receipt with downloadable PDF is available for customer support and dispute handling.
-          </div>
-
-          <div class="footnote">
-            Gateway: ${escapeHtml(baseUrl)} • End-to-end hosted transaction flow.
-          </div>
-        </div>
-      </section>
-
-      <aside class="side">
-        <h3>Security & Compliance</h3>
-        <div class="trust">
-          <ul>
-            <li><span class="dot"></span><span>Hosted redirection to secure card entry</span></li>
-            <li><span class="dot"></span><span>3D Secure cardholder authentication</span></li>
-            <li><span class="dot"></span><span>Response-code based transaction validation</span></li>
-            <li><span class="dot"></span><span>Downloadable PDF receipt for support sharing</span></li>
-          </ul>
-        </div>
-        <div class="notice" style="margin-top:12px;border-color:#d8e7ff;background:#f4f8ff;color:#2c4f83">
-          Recommended: verify MID and amount before submission. For callback troubleshooting, share the receipt and transaction ID with the portal owner.
-        </div>
-      </aside>
+  <section class="card">
+    <div class="head">
+      <h1>Merchant Login</h1>
+      <p>Sign in to open your mapped payment portal.</p>
     </div>
-  </div>
+    <div class="body">
+      ${safeError ? `<p class="error">${safeError}</p>` : ''}
+      <form id="loginForm" method="post" action="/api/login" autocomplete="on">
+        <label for="username">Username</label>
+        <input id="username" name="username" required placeholder="Enter username" />
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" required placeholder="Enter password" />
+        <button id="loginBtn" type="submit">Login</button>
+      </form>
+      <div class="tiny">Gateway: ${escapeHtml(baseUrl)}</div>
+    </div>
+  </section>
   <script>
     (function () {
-      const form = document.getElementById('checkoutForm');
-      const midInput = document.getElementById('merchantId');
-      const amountInput = document.getElementById('amount');
-      const customerNameInput = document.getElementById('customerName');
-      const emailInput = document.getElementById('email');
-      const currencyLabel = document.getElementById('currencyLabel');
-      const currencyPill = document.getElementById('currencyPill');
-      const currencyInput = document.getElementById('currency');
-      const proceedButton = document.getElementById('proceedButton');
-      const generateLinkButton = document.getElementById('generateLinkButton');
-      const copyLinkButton = document.getElementById('copyLinkButton');
-      const paymentLinkPanel = document.getElementById('paymentLinkPanel');
-      const paymentLinkOutput = document.getElementById('paymentLinkOutput');
-      const paymentLinkMeta = document.getElementById('paymentLinkMeta');
-
-      const currencyCodeToName = {
-        '840': 'USD',
-        '356': 'INR',
-        '064': 'BTN',
-        '524': 'NPR',
-        '144': 'LKR',
-        '586': 'PKR',
-        '050': 'BDT',
-        '702': 'SGD',
-        '978': 'EUR',
-        '826': 'GBP',
-        '036': 'AUD',
-        '124': 'CAD',
-        '392': 'JPY',
-        '156': 'CNY',
-        '410': 'KRW'
-      };
-
-      async function updateCurrency() {
-        const merchantId = (midInput.value || '').trim();
-        if (!merchantId) {
-          currencyInput.value = '';
-          currencyLabel.textContent = '';
-          currencyPill.style.display = 'none';
-          return;
-        }
-
+      const form = document.getElementById('loginForm');
+      const loginBtn = document.getElementById('loginBtn');
+      form.addEventListener('submit', async function (event) {
+        event.preventDefault();
+        loginBtn.disabled = true;
+        loginBtn.textContent = 'Signing in...';
         try {
-          const res = await fetch('/api/merchant-currency?merchantId=' + encodeURIComponent(merchantId), {
-            method: 'GET',
-            headers: { 'Accept': 'application/json' }
-          });
+          const formData = new FormData(form);
+          const payload = {
+            username: String(formData.get('username') || '').trim(),
+            password: String(formData.get('password') || '')
+          };
 
-          if (!res.ok) {
-            currencyInput.value = '';
-            currencyLabel.textContent = '';
-            currencyPill.style.display = 'none';
-            return;
-          }
-
-          const data = await res.json();
-          const code = (data && data.currency) ? String(data.currency) : '';
-          currencyInput.value = code;
-          const displayName = currencyCodeToName[code] || code;
-          currencyLabel.textContent = displayName || '';
-          currencyPill.style.display = displayName ? 'inline-flex' : 'none';
-        } catch {
-          currencyInput.value = '';
-          currencyLabel.textContent = '';
-          currencyPill.style.display = 'none';
-        }
-      }
-
-      async function generatePaymentLink() {
-        const merchantId = (midInput.value || '').trim();
-        const amount = (amountInput.value || '').trim();
-
-        if (!merchantId || !amount) {
-          window.alert('Enter MID and amount first.');
-          return;
-        }
-
-        generateLinkButton.disabled = true;
-        generateLinkButton.textContent = 'Generating...';
-
-        try {
-          await updateCurrency();
-
-          const res = await fetch('/api/payment-links', {
+          const res = await fetch('/api/login', {
             method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Accept': 'application/json'
-            },
-            body: JSON.stringify({
-              merchantId,
-              amount,
-              currency: currencyInput.value,
-              customerName: (customerNameInput.value || '').trim(),
-              email: (emailInput.value || '').trim()
-            })
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            body: JSON.stringify(payload)
           });
 
-          const data = await res.json();
-          if (!res.ok || !data.paymentUrl) {
-            throw new Error(data.error || 'Unable to generate payment link.');
+          const data = await res.json().catch(function () { return {}; });
+          if (!res.ok) {
+            throw new Error(data.error || 'Invalid username or password.');
           }
 
-          paymentLinkOutput.value = data.paymentUrl;
-          paymentLinkMeta.textContent = 'Currency: ' + data.currency + ' • Expires: ' + new Date(data.expiresAt).toLocaleString();
-          paymentLinkPanel.classList.add('active');
+          window.location.href = '/portal';
         } catch (error) {
-          window.alert(error.message || 'Unable to generate payment link.');
-        } finally {
-          generateLinkButton.disabled = false;
-          generateLinkButton.textContent = 'Generate Payment Link';
+          window.alert(error.message || 'Unable to login.');
+          loginBtn.disabled = false;
+          loginBtn.textContent = 'Login';
         }
-      }
-
-      async function copyPaymentLink() {
-        const value = paymentLinkOutput.value || '';
-        if (!value) return;
-
-        try {
-          await navigator.clipboard.writeText(value);
-          copyLinkButton.textContent = 'Copied';
-          setTimeout(() => {
-            copyLinkButton.textContent = 'Copy Link';
-          }, 1500);
-        } catch {
-          paymentLinkOutput.focus();
-          paymentLinkOutput.select();
-        }
-      }
-
-      function handleSubmit() {
-        proceedButton.disabled = true;
-        proceedButton.textContent = 'Redirecting to Bank Gateway...';
-      }
-
-      midInput.addEventListener('input', updateCurrency);
-      generateLinkButton.addEventListener('click', generatePaymentLink);
-      copyLinkButton.addEventListener('click', copyPaymentLink);
-      form.addEventListener('submit', handleSubmit);
-      updateCurrency();
+      });
     })();
   </script>
 </body>
 </html>`;
 }
+
+function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
+  const safeSessionJson = JSON.stringify(sessionView || {}).replace(/</g, '\\u003c');
+  const safePortalJson = JSON.stringify(portalModel || {}).replace(/</g, '\\u003c');
+
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Merchant Portal</title>
+  <style>
+    :root{--sidebar:#111827;--sidebar2:#1f2937;--text:#0f172a;--muted:#64748b;--bg:#f8fafc;--card:#ffffff;--line:#e2e8f0;--accent:#2563eb}
+    *{box-sizing:border-box}
+    body{margin:0;font-family:Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--text)}
+    .app{display:grid;grid-template-columns:290px 1fr;min-height:100vh}
+    .sidebar{background:linear-gradient(180deg,var(--sidebar),var(--sidebar2));color:#e5e7eb;padding:18px 14px;overflow:auto}
+    .brand{font-weight:800;font-size:17px;letter-spacing:.2px;margin:2px 8px 16px}
+    .menu-group{margin:8px 0}
+    .menu-head,.menu-item{width:100%;text-align:left;border:0;background:transparent;color:#dbe2ee;padding:9px 10px;border-radius:8px;cursor:pointer;font-size:13.5px}
+    .menu-head{font-weight:700;color:#fff}
+    .menu-item{padding-left:22px;color:#c9d4e6}
+    .menu-head:hover,.menu-item:hover,.menu-item.active{background:rgba(255,255,255,.08)}
+    .submenu{display:grid;gap:4px;margin-top:4px}
+
+    .content{padding:22px 22px 26px}
+    .topbar{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+    .title{margin:0;font-size:24px}
+    .subtitle{margin:4px 0 0;color:var(--muted);font-size:13px}
+    .actions{display:flex;gap:8px;flex-wrap:wrap}
+    .btn{border:1px solid var(--line);background:#fff;color:#1f2f49;border-radius:8px;padding:9px 12px;font-size:12.5px;font-weight:700;cursor:pointer}
+    .btn.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+
+    .section{display:none}
+    .section.active{display:block}
+    .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px}
+    .card{grid-column:span 12;background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+    .card h3{margin:0;padding:12px 14px;border-bottom:1px solid var(--line);font-size:15px}
+    .card-body{padding:12px 14px}
+    .kv{display:grid;grid-template-columns:220px 1fr;border-top:1px solid var(--line)}
+    .kv:first-child{border-top:0}
+    .kv div{padding:9px 10px;font-size:13px}
+    .kv .k{background:#f8fafc;color:#475569;font-weight:700}
+    .kv input:not([type=checkbox]),.kv select,.kv textarea{width:100%;border:1px solid var(--line);border-radius:8px;padding:7px 9px;font-size:13px;font-family:inherit}
+    .kv input[type=checkbox]{width:auto;margin-right:6px;vertical-align:middle}
+    .kv textarea{resize:vertical}
+    .status-pill{display:inline-block;padding:3px 10px;border-radius:999px;font-size:11.5px;font-weight:700;color:#fff}
+    .status-pill.paid{background:#16a34a}
+    .status-pill.pending{background:#f59e0b}
+    .status-pill.failed{background:#dc2626}
+    .status-pill.expired{background:#64748b}
+    .form-actions{padding:12px 10px;display:flex;align-items:center;gap:10px}
+    .credential-box{display:none;margin-top:10px;padding:10px;border:1px solid var(--line);border-radius:8px;background:#f8fafc}
+    .credential-body{margin-top:6px;font-family:monospace;font-size:13px}
+    .logo{height:52px;width:auto;max-width:180px;object-fit:contain}
+    .muted{color:var(--muted)}
+    .list{margin:0;padding-left:18px;color:#334155;font-size:13px;display:grid;gap:6px}
+
+    .col-6{grid-column:span 6}
+    .col-4{grid-column:span 4}
+    .col-8{grid-column:span 8}
+    .col-12{grid-column:span 12}
+
+    @media (max-width:1080px){
+      .app{grid-template-columns:1fr}
+      .sidebar{position:sticky;top:0;max-height:42vh;z-index:2}
+      .col-6,.col-4,.col-8{grid-column:span 12}
+      .kv{grid-template-columns:1fr}
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">Merchant Portal</div>
+
+      <div class="menu-group">
+        <button class="menu-head nav-btn" data-target="dashboard">User Dashboard</button>
+      </div>
+
+      <div class="menu-group">
+        <button class="menu-head">Invoices</button>
+        <div class="submenu">
+          <button class="menu-item nav-btn" data-target="invoices-create">Create Invoice</button>
+          <button class="menu-item nav-btn" data-target="invoices-all">View All Invoices</button>
+          <button class="menu-item nav-btn" data-target="invoices-payments">View My Payments</button>
+          <button class="menu-item nav-btn" data-target="invoices-emails">View Emails Sent</button>
+        </div>
+      </div>
+
+      ${sessionView?.role === 'developer' ? `
+      <div class="menu-group">
+        <button class="menu-head">Developer Tools</button>
+        <div class="submenu">
+          <button class="menu-item nav-btn" data-target="developer-add-merchant">Add New Merchant</button>
+          <button class="menu-item nav-btn" data-target="developer-merchants-list">All Merchants</button>
+        </div>
+      </div>
+      ` : ''}
+
+      <div class="menu-group">
+        <button class="menu-head">My Account</button>
+        <div class="submenu">
+          <button class="menu-item nav-btn" data-target="merchant-profile">Merchant Profile</button>
+          <button class="menu-item nav-btn" data-target="account-password">Change Password</button>
+          <button class="menu-item nav-btn" data-target="account-edit">Edit Username</button>
+          <button class="menu-item" id="logoutBtn">Logout</button>
+        </div>
+      </div>
+    </aside>
+
+    <main class="content">
+      <div class="topbar">
+        <div>
+          <h1 class="title">Welcome, <span id="welcomeName"></span></h1>
+          <p class="subtitle">Create and track invoices, and manage your merchant profile from one place.</p>
+        </div>
+        <div class="actions">
+          <button class="btn primary" id="editMerchantTop">Edit Profile</button>
+        </div>
+      </div>
+
+      <section class="section active" id="dashboard">
+        <div class="grid">
+          <article class="card col-4"><h3>Merchant</h3><div class="card-body"><div id="dashMerchant" class="muted"></div></div></article>
+          <article class="card col-4"><h3>Default Currency</h3><div class="card-body"><div id="dashCurrency" class="muted"></div></div></article>
+          <article class="card col-4"><h3>Gateway</h3><div class="card-body"><div class="muted">${escapeHtml(baseUrl)}</div></div></article>
+          <article class="card col-12"><h3>Quick Notes</h3><div class="card-body"><ul class="list"><li>Create an invoice to generate a payment link for a customer.</li><li>Email sending is coming in a later phase &mdash; for now, share the link or PDF directly.</li><li>Use <strong>My Account &rarr; Merchant Profile</strong> to update your details, password, or username.</li></ul></div></article>
+        </div>
+      </section>
+
+      <section class="section" id="merchant-profile">
+        <div class="grid">
+          <article class="card col-8">
+            <h3>Merchant Profile</h3>
+            <div class="card-body">
+              <form id="merchantEditForm">
+                <div class="kv"><div class="k"><label for="editMerchantName">Merchant Name</label></div><div><input id="editMerchantName" required /></div></div>
+                <div class="kv"><div class="k">Logo</div><div>
+                  <img id="editLogoPreview" class="logo" alt="Logo preview" style="display:none;margin-bottom:8px" />
+                  <input id="editLogoFile" type="file" accept="image/*" />
+                  <input id="editLogoUrl" placeholder="or paste an image https:// URL" style="margin-top:6px" />
+                </div></div>
+                <div class="kv"><div class="k"><label for="editAddress">Address</label></div><div><textarea id="editAddress" rows="3" placeholder="One line per address line"></textarea></div></div>
+                <div class="kv"><div class="k"><label for="editEmail">Email Address</label></div><div><input id="editEmail" type="email" /></div></div>
+                <div class="kv"><div class="k"><label for="editPhone">Phone Number</label></div><div><input id="editPhone" /></div></div>
+                <div class="kv"><div class="k">Invoice Settings</div><div>
+                  <label style="display:block;margin-bottom:4px;font-weight:400"><input type="checkbox" id="editUseCustomerNames" /> Use Customer Name in Invoice</label>
+                  <label style="display:block;margin-bottom:4px;font-weight:400"><input type="checkbox" id="editSendInvoiceViaEmail" /> Send Invoice via Email</label>
+                  <label style="display:block;font-weight:400"><input type="checkbox" id="editAllowExternalPayments" /> Accept External Payments</label>
+                </div></div>
+                <div class="kv"><div class="k"><label for="editPaymentMessage">Default Payment Message</label></div><div>
+                  <textarea id="editPaymentMessage" rows="3"></textarea>
+                  <div class="muted" style="font-size:11.5px;margin-top:3px">Shown to customer on payment page. Used when an invoice doesn't set its own message.</div>
+                </div></div>
+                <div class="kv"><div class="k"><label for="editSuccessMessage">Default Payment Success Message</label></div><div>
+                  <textarea id="editSuccessMessage" rows="3"></textarea>
+                  <div class="muted" style="font-size:11.5px;margin-top:3px">Shown to customer after a successful payment.</div>
+                </div></div>
+                <div class="kv"><div class="k"><label for="editTerms">Terms &amp; Conditions</label></div><div>
+                  <textarea id="editTerms" rows="3"></textarea>
+                  <div class="muted" style="font-size:11.5px;margin-top:3px">Shown on the payment page and linked from every invoice.</div>
+                </div></div>
+                <div class="form-actions"><button class="btn primary" type="submit">Save Merchant Profile</button><span id="merchantEditMsg" class="muted"></span></div>
+              </form>
+            </div>
+          </article>
+
+          <article class="card col-4">
+            <h3>Gateway Mapping</h3>
+            <div class="card-body">
+              <div class="kv"><div class="k">USD Merchant ID</div><div id="usdMid"></div></div>
+              <div class="kv"><div class="k">INR Merchant ID</div><div id="inrMid"></div></div>
+              <div class="muted" style="margin-top:10px;font-size:12px">Gateway merchant IDs are managed by your developer/admin and shown here read-only.</div>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="section" id="invoices-create">
+        <div class="grid">
+          <article class="card col-8">
+            <h3>Create Invoice</h3>
+            <div class="card-body">
+              <form id="invoiceForm">
+                <div class="kv"><div class="k">Invoice No</div><div><input id="invNumberDisplay" readonly placeholder="Auto-generated" /></div></div>
+                <div class="kv"><div class="k"><label for="invCustomerName">Customer Name</label></div><div><input id="invCustomerName" required /></div></div>
+                <div class="kv" id="invCurrencyWrap" style="display:none"><div class="k"><label for="invCurrency">Currency</label></div><div><select id="invCurrency"></select></div></div>
+                <div class="kv"><div class="k"><label for="invAmount">Amount</label></div><div><input id="invAmount" type="number" min="0.01" step="0.01" required /></div></div>
+                <div class="kv"><div class="k"><label for="invCustomerMessage">Payment Message</label></div><div>
+                  <textarea id="invCustomerMessage" rows="2"></textarea>
+                  <div class="muted" style="font-size:11.5px;margin-top:3px">Shown to customer on payment page. Default message will be used if left blank.</div>
+                </div></div>
+                <div class="form-actions"><button class="btn primary" type="submit">Generate Payment Link</button><span id="invoiceMsg" class="muted"></span></div>
+              </form>
+
+              <div id="invoiceResult" style="display:none;margin-top:14px;padding:12px;border:1px solid var(--line);border-radius:8px;background:#f8fafc">
+                <div class="muted" style="margin-bottom:6px">Invoice <strong id="invoiceResultNumber"></strong> created</div>
+                <input id="invoiceResultLink" readonly style="width:100%;border:1px solid var(--line);border-radius:8px;padding:8px;font-size:12.5px;font-family:monospace" />
+                <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+                  <button class="btn" type="button" id="copyInvoiceLinkBtn">Copy Payment Link</button>
+                  <a id="downloadInvoicePdfLink" href="#" target="_blank"><button class="btn" type="button">Download PDF Invoice</button></a>
+                  <button class="btn" type="button" id="emailInvoiceBtn">Email Invoice</button>
+                </div>
+              </div>
+
+              <div id="emailInvoicePanel" style="display:none;margin-top:14px;border:1px solid var(--line);border-radius:8px;overflow:hidden">
+                <h3 style="margin:0;padding:12px 14px;border-bottom:1px solid var(--line);font-size:15px">Send Invoice to Customer</h3>
+                <div style="padding:12px 14px">
+                  <div class="muted" style="font-weight:700;margin-bottom:6px">Invoice Details</div>
+                  <div class="kv"><div class="k">Invoice No</div><div id="emailInvoiceNumberVal"></div></div>
+                  <div class="kv"><div class="k">Customer Name</div><div id="emailInvoiceCustomerVal"></div></div>
+                  <div class="kv"><div class="k">Amount</div><div id="emailInvoiceAmountVal"></div></div>
+                  <div style="margin-top:14px"><label for="emailInvoiceTo" style="display:block;font-size:12.5px;font-weight:700;margin-bottom:6px">Email address to send invoice to</label><input id="emailInvoiceTo" type="email" /></div>
+                  <div style="margin-top:10px"><label for="emailInvoiceMessage" style="display:block;font-size:12.5px;font-weight:700;margin-bottom:6px">Message (Optional)</label><textarea id="emailInvoiceMessage" rows="4"></textarea></div>
+                  <div class="form-actions"><button class="btn primary" type="button" id="sendInvoiceEmailBtn">&#9993;&nbsp;Send Invoice</button><span id="emailInvoiceMsg" class="muted"></span></div>
+                </div>
+              </div>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="section" id="invoices-all">
+        <div class="card">
+          <h3>View All Invoices</h3>
+          <div class="card-body">
+            <table style="width:100%;border-collapse:collapse;font-size:13px">
+              <thead><tr style="text-align:left;border-bottom:1px solid var(--line)"><th style="padding:6px">Invoice #</th><th style="padding:6px">Date Created</th><th style="padding:6px">Customer</th><th style="padding:6px">Currency</th><th style="padding:6px">Amount</th><th style="padding:6px">Payment Status</th><th style="padding:6px">Created By</th><th style="padding:6px">Actions</th></tr></thead>
+              <tbody id="allInvoicesBody"><tr><td class="muted" style="padding:6px" colspan="8">Loading...</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="invoices-payments">
+        <div class="card">
+          <h3>View My Payments</h3>
+          <div class="card-body">
+            <table style="width:100%;border-collapse:collapse;font-size:13px">
+              <thead><tr style="text-align:left;border-bottom:1px solid var(--line)"><th style="padding:6px">Invoice #</th><th style="padding:6px">Date Created</th><th style="padding:6px">Customer</th><th style="padding:6px">Currency</th><th style="padding:6px">Amount</th><th style="padding:6px">Payment Status</th><th style="padding:6px">Created By</th><th style="padding:6px">Actions</th></tr></thead>
+              <tbody id="paidInvoicesBody"><tr><td class="muted" style="padding:6px" colspan="8">Loading...</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="invoices-emails"><div class="card"><h3>View Emails Sent</h3><div class="card-body muted">Coming in the next phase.</div></div></section>
+
+      <section class="section" id="account-password">
+        <div class="card">
+          <h3>Change Password</h3>
+          <div class="card-body">
+            <form id="passwordForm">
+              <div class="kv"><div class="k"><label for="currentPassword">Current Password</label></div><div><input id="currentPassword" type="password" required /></div></div>
+              <div class="kv"><div class="k"><label for="newPassword">New Password</label></div><div><input id="newPassword" type="password" required minlength="8" /></div></div>
+              <div class="kv"><div class="k"><label for="confirmPassword">Confirm New Password</label></div><div><input id="confirmPassword" type="password" required minlength="8" /></div></div>
+              <div class="form-actions"><button class="btn primary" type="submit">Update Password</button><span id="passwordMsg" class="muted"></span></div>
+            </form>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="account-edit">
+        <div class="card">
+          <h3>Edit Username</h3>
+          <div class="card-body">
+            <form id="usernameForm">
+              <div class="kv"><div class="k">Current Username</div><div id="currentUsernameVal"></div></div>
+              <div class="kv"><div class="k"><label for="newUsername">New Username</label></div><div><input id="newUsername" required minlength="3" maxlength="40" /></div></div>
+              <div class="kv"><div class="k"><label for="usernameCurrentPassword">Current Password</label></div><div><input id="usernameCurrentPassword" type="password" required /></div></div>
+              <div class="form-actions"><button class="btn primary" type="submit">Update Username</button><span id="usernameMsg" class="muted"></span></div>
+            </form>
+          </div>
+        </div>
+      </section>
+
+      ${sessionView?.role === 'developer' ? `
+      <section class="section" id="developer-add-merchant">
+        <div class="card">
+          <h3>Add New Merchant</h3>
+          <div class="card-body">
+            <form id="addMerchantForm">
+              <div class="kv"><div class="k"><label for="newMerchantUsername">Username</label></div><div><input id="newMerchantUsername" required minlength="3" maxlength="40" /></div></div>
+              <div class="kv"><div class="k"><label for="newMerchantDisplayName">Display Name</label></div><div><input id="newMerchantDisplayName" required /></div></div>
+              <div class="kv"><div class="k"><label for="newMerchantCompanyName">Company Name</label></div><div><input id="newMerchantCompanyName" /></div></div>
+              <div class="kv"><div class="k"><label for="newMerchantEmail">Email</label></div><div><input id="newMerchantEmail" type="email" /></div></div>
+              <div class="kv"><div class="k"><label for="newMerchantPhone">Phone</label></div><div><input id="newMerchantPhone" /></div></div>
+              <div class="kv"><div class="k">Logo</div><div>
+                <img id="newMerchantLogoPreview" class="logo" alt="Logo preview" style="display:none;margin-bottom:8px" />
+                <input id="newMerchantLogoFile" type="file" accept="image/*" />
+                <input id="newMerchantLogoUrl" placeholder="or paste an image https:// URL" style="margin-top:6px" />
+              </div></div>
+              <div class="kv"><div class="k">Available Merchant IDs</div><div id="unassignedMidPicker" class="muted">Loading...</div></div>
+              <div class="form-actions"><button class="btn primary" type="submit">Create Merchant</button><span id="addMerchantMsg" class="muted"></span></div>
+            </form>
+            <div id="generatedCredentials" class="credential-box">
+              <strong>Save these credentials — shown only once:</strong>
+              <div id="generatedCredentialsBody" class="credential-body"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="developer-merchants-list">
+        <div class="card">
+          <h3>All Merchants</h3>
+          <div class="card-body">
+            <table style="width:100%;border-collapse:collapse;font-size:13px">
+              <thead><tr style="text-align:left;border-bottom:1px solid var(--line)"><th style="padding:6px">Username</th><th style="padding:6px">Display Name</th><th style="padding:6px">USD MID</th><th style="padding:6px">INR MID</th></tr></thead>
+              <tbody id="merchantsTableBody"><tr><td class="muted" style="padding:6px" colspan="4">Loading...</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+      ` : ''}
+    </main>
+  </div>
+
+  <script>
+    (function () {
+      const session = ${safeSessionJson};
+      const portal = ${safePortalJson};
+
+      function setText(id, value) {
+        const el = document.getElementById(id);
+        if (el) el.textContent = value || '—';
+      }
+
+      var LOGO_MAX_FILE_BYTES = 1500000;
+
+      function wireLogoUpload(fileInputId, urlInputId, previewId) {
+        const fileInput = document.getElementById(fileInputId);
+        const urlInput = document.getElementById(urlInputId);
+        const preview = document.getElementById(previewId);
+        let dataUrl = '';
+
+        function updatePreview(src) {
+          if (src) {
+            preview.src = src;
+            preview.style.display = '';
+          } else {
+            preview.style.display = 'none';
+          }
+        }
+
+        fileInput.addEventListener('change', function () {
+          const file = fileInput.files && fileInput.files[0];
+          if (!file) return;
+          if (file.size > LOGO_MAX_FILE_BYTES) {
+            window.alert('Image is too large (max ~1.5MB). Please choose a smaller file.');
+            fileInput.value = '';
+            return;
+          }
+          const reader = new FileReader();
+          reader.onload = function () {
+            dataUrl = String(reader.result || '');
+            urlInput.value = '';
+            updatePreview(dataUrl);
+          };
+          reader.readAsDataURL(file);
+        });
+
+        urlInput.addEventListener('input', function () {
+          dataUrl = '';
+          updatePreview(urlInput.value.trim());
+        });
+
+        return {
+          getValue: function () { return dataUrl || urlInput.value.trim(); },
+          setInitial: function (url) { updatePreview(url); },
+          reset: function () {
+            dataUrl = '';
+            fileInput.value = '';
+            urlInput.value = '';
+            updatePreview('');
+          }
+        };
+      }
+
+      document.getElementById('welcomeName').textContent = session.displayName || session.username || 'Merchant';
+      setText('dashMerchant', portal.merchantName || session.displayName || session.username || 'Merchant');
+      setText('dashCurrency', session.defaultCurrency || '—');
+      setText('usdMid', portal.usdSettings && portal.usdSettings.merchantId);
+      setText('inrMid', portal.inrSettings && portal.inrSettings.merchantId);
+
+      function showSection(id) {
+        document.querySelectorAll('.section').forEach(function (sec) {
+          sec.classList.toggle('active', sec.id === id);
+        });
+        document.querySelectorAll('.menu-item,.menu-head.nav-btn').forEach(function (btn) {
+          btn.classList.toggle('active', btn.getAttribute('data-target') === id);
+        });
+      }
+
+      document.querySelectorAll('.nav-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          const target = btn.getAttribute('data-target');
+          if (target) showSection(target);
+        });
+      });
+
+      document.getElementById('editMerchantTop').addEventListener('click', function () { showSection('merchant-profile'); });
+
+      document.getElementById('logoutBtn').addEventListener('click', async function () {
+        try {
+          await fetch('/api/logout', { method: 'POST', headers: { 'Accept': 'application/json' } });
+        } finally {
+          window.location.href = '/login';
+        }
+      });
+
+      document.getElementById('editMerchantName').value = portal.merchantName || '';
+      document.getElementById('editAddress').value = portal.address || '';
+      document.getElementById('editEmail').value = portal.email || '';
+      document.getElementById('editPhone').value = portal.phone || '';
+      document.getElementById('currentUsernameVal').textContent = session.username || '';
+      document.getElementById('editUseCustomerNames').checked = !!(portal.settings && portal.settings.useCustomerNames);
+      document.getElementById('editSendInvoiceViaEmail').checked = !!(portal.settings && portal.settings.sendInvoiceViaEmail);
+      document.getElementById('editAllowExternalPayments').checked = !!(portal.settings && portal.settings.allowExternalPayments);
+      document.getElementById('editPaymentMessage').value = (portal.settings && portal.settings.paymentMessage) || '';
+      document.getElementById('editSuccessMessage').value = (portal.settings && portal.settings.successfulPaymentMessage) || '';
+      document.getElementById('editTerms').value = (portal.settings && portal.settings.termsAndConditions) || '';
+
+      const editLogo = wireLogoUpload('editLogoFile', 'editLogoUrl', 'editLogoPreview');
+      editLogo.setInitial(portal.logoUrl || '');
+
+      document.getElementById('merchantEditForm').addEventListener('submit', async function (event) {
+        event.preventDefault();
+        const msg = document.getElementById('merchantEditMsg');
+        msg.textContent = 'Saving...';
+        try {
+          const res = await fetch('/api/merchant/profile', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            body: JSON.stringify({
+              merchantName: document.getElementById('editMerchantName').value.trim(),
+              logoUrl: editLogo.getValue(),
+              address: document.getElementById('editAddress').value.trim(),
+              email: document.getElementById('editEmail').value.trim(),
+              phone: document.getElementById('editPhone').value.trim(),
+              useCustomerNames: document.getElementById('editUseCustomerNames').checked,
+              sendInvoiceViaEmail: document.getElementById('editSendInvoiceViaEmail').checked,
+              allowExternalPayments: document.getElementById('editAllowExternalPayments').checked,
+              paymentMessage: document.getElementById('editPaymentMessage').value.trim(),
+              successfulPaymentMessage: document.getElementById('editSuccessMessage').value.trim(),
+              termsAndConditions: document.getElementById('editTerms').value.trim()
+            })
+          });
+          const data = await res.json().catch(function () { return {}; });
+          if (!res.ok) throw new Error(data.error || 'Unable to save profile.');
+
+          msg.textContent = 'Saved.';
+          setText('dashMerchant', data.profile.merchantName);
+          editLogo.setInitial(data.profile.logoUrl || '');
+          portal.settings = data.profile.settings;
+        } catch (error) {
+          msg.textContent = error.message || 'Error saving profile.';
+        }
+      });
+
+      document.getElementById('passwordForm').addEventListener('submit', async function (event) {
+        event.preventDefault();
+        const msg = document.getElementById('passwordMsg');
+        const newPassword = document.getElementById('newPassword').value;
+        const confirmPassword = document.getElementById('confirmPassword').value;
+        if (newPassword !== confirmPassword) {
+          msg.textContent = 'New password and confirmation do not match.';
+          return;
+        }
+        msg.textContent = 'Saving...';
+        try {
+          const res = await fetch('/api/account/password', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            body: JSON.stringify({
+              currentPassword: document.getElementById('currentPassword').value,
+              newPassword: newPassword
+            })
+          });
+          const data = await res.json().catch(function () { return {}; });
+          if (!res.ok) throw new Error(data.error || 'Unable to update password.');
+          msg.textContent = 'Password updated.';
+          document.getElementById('passwordForm').reset();
+        } catch (error) {
+          msg.textContent = error.message || 'Error updating password.';
+        }
+      });
+
+      document.getElementById('usernameForm').addEventListener('submit', async function (event) {
+        event.preventDefault();
+        const msg = document.getElementById('usernameMsg');
+        msg.textContent = 'Saving...';
+        try {
+          const res = await fetch('/api/account/username', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            body: JSON.stringify({
+              newUsername: document.getElementById('newUsername').value.trim(),
+              currentPassword: document.getElementById('usernameCurrentPassword').value
+            })
+          });
+          const data = await res.json().catch(function () { return {}; });
+          if (!res.ok) throw new Error(data.error || 'Unable to update username.');
+          msg.textContent = 'Username updated. Redirecting to login...';
+          setTimeout(function () { window.location.href = '/login'; }, 1200);
+        } catch (error) {
+          msg.textContent = error.message || 'Error updating username.';
+        }
+      });
+
+      (function () {
+        const currencyNamesInv = { '840': 'USD', '356': 'INR', '064': 'BTN' };
+        const invCurrencySelect = document.getElementById('invCurrency');
+        const invCurrencyWrap = document.getElementById('invCurrencyWrap');
+        const merchantIdsByCurrency = (session && session.merchantIdsByCurrency) ? session.merchantIdsByCurrency : {};
+
+        function currentInvoiceCurrency() {
+          return invCurrencySelect.value || session.defaultCurrency || '';
+        }
+
+        const currencies = Object.keys(merchantIdsByCurrency);
+        if (currencies.length > 1) {
+          invCurrencyWrap.style.display = '';
+          invCurrencySelect.innerHTML = currencies.map(function (code) {
+            const label = currencyNamesInv[code] || code;
+            return '<option value="' + code + '">' + label + ' (' + code + ')</option>';
+          }).join('');
+          if (session.defaultCurrency && merchantIdsByCurrency[session.defaultCurrency]) {
+            invCurrencySelect.value = session.defaultCurrency;
+          }
+        } else {
+          invCurrencyWrap.style.display = 'none';
+        }
+
+        document.getElementById('invCustomerMessage').value = (portal.settings && portal.settings.paymentMessage) || '';
+
+        let lastCreatedInvoice = null;
+
+        document.getElementById('invoiceForm').addEventListener('submit', async function (event) {
+          event.preventDefault();
+          const msg = document.getElementById('invoiceMsg');
+          msg.textContent = 'Generating...';
+          try {
+            const res = await fetch('/api/invoices', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+              body: JSON.stringify({
+                currency: currentInvoiceCurrency(),
+                amount: document.getElementById('invAmount').value.trim(),
+                customerName: document.getElementById('invCustomerName').value.trim(),
+                customerMessage: document.getElementById('invCustomerMessage').value.trim()
+              })
+            });
+            const data = await res.json().catch(function () { return {}; });
+            if (!res.ok) throw new Error(data.error || 'Unable to create invoice.');
+
+            msg.textContent = 'Invoice created.';
+            lastCreatedInvoice = data.invoice;
+            document.getElementById('invNumberDisplay').value = data.invoice._id;
+            document.getElementById('invoiceResultNumber').textContent = data.invoice._id;
+            document.getElementById('invoiceResultLink').value = data.paymentUrl;
+            document.getElementById('downloadInvoicePdfLink').href = '/api/invoices/' + encodeURIComponent(data.invoice._id) + '/pdf';
+            document.getElementById('invoiceResult').style.display = 'block';
+            document.getElementById('emailInvoicePanel').style.display = 'none';
+          } catch (error) {
+            msg.textContent = error.message || 'Error creating invoice.';
+          }
+        });
+
+        document.getElementById('copyInvoiceLinkBtn').addEventListener('click', async function () {
+          const btn = document.getElementById('copyInvoiceLinkBtn');
+          try {
+            await navigator.clipboard.writeText(document.getElementById('invoiceResultLink').value);
+            const original = btn.textContent;
+            btn.textContent = 'Copied!';
+            setTimeout(function () { btn.textContent = original; }, 1500);
+          } catch (error) {
+            window.alert('Unable to copy. Please copy the link manually.');
+          }
+        });
+
+        document.getElementById('emailInvoiceBtn').addEventListener('click', function () {
+          if (!lastCreatedInvoice) return;
+          const currencyLabel = currencyNamesInv[lastCreatedInvoice.currency] || lastCreatedInvoice.currency;
+          document.getElementById('emailInvoiceNumberVal').textContent = lastCreatedInvoice._id;
+          document.getElementById('emailInvoiceCustomerVal').textContent = lastCreatedInvoice.customerName || '';
+          document.getElementById('emailInvoiceAmountVal').textContent = currencyLabel + ' ' + Number(lastCreatedInvoice.amount).toFixed(2);
+          document.getElementById('emailInvoiceTo').value = lastCreatedInvoice.customerEmail || '';
+          document.getElementById('emailInvoiceMessage').value = lastCreatedInvoice.customerMessage || '';
+          document.getElementById('emailInvoiceMsg').textContent = '';
+          document.getElementById('emailInvoicePanel').style.display = 'block';
+        });
+
+        document.getElementById('sendInvoiceEmailBtn').addEventListener('click', function () {
+          document.getElementById('emailInvoiceMsg').textContent = 'Email sending is not connected yet — coming in a later phase.';
+        });
+
+        function renderInvoicesTable(tbodyId, invoices) {
+          const tbody = document.getElementById(tbodyId);
+          if (!invoices.length) {
+            tbody.innerHTML = '<tr><td class="muted" style="padding:6px" colspan="8">No invoices yet.</td></tr>';
+            return;
+          }
+          tbody.innerHTML = invoices.map(function (inv) {
+            const currencyLabel = currencyNamesInv[inv.currency] || inv.currency;
+            const amount = Number(inv.amount).toFixed(2);
+            const created = new Date(inv.createdAt).toLocaleDateString();
+            const pdfUrl = '/api/invoices/' + encodeURIComponent(inv._id) + '/pdf';
+            const status = String(inv.status || 'pending').toLowerCase();
+            const statusLabel = status.charAt(0).toUpperCase() + status.slice(1);
+            return '<tr style="border-top:1px solid #e2e8f0">' +
+              '<td style="padding:6px">' + inv._id + '</td>' +
+              '<td style="padding:6px">' + created + '</td>' +
+              '<td style="padding:6px">' + (inv.customerName || '—') + '</td>' +
+              '<td style="padding:6px">' + currencyLabel + '</td>' +
+              '<td style="padding:6px">' + amount + '</td>' +
+              '<td style="padding:6px"><span class="status-pill ' + status + '">' + statusLabel + '</span></td>' +
+              '<td style="padding:6px">' + (inv.username || '—') + '</td>' +
+              '<td style="padding:6px"><a href="' + pdfUrl + '" target="_blank">PDF</a></td>' +
+              '</tr>';
+          }).join('');
+        }
+
+        async function loadInvoices(tbodyId, statusFilter) {
+          try {
+            const url = statusFilter ? '/api/invoices?status=' + encodeURIComponent(statusFilter) : '/api/invoices';
+            const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
+            const data = await res.json().catch(function () { return {}; });
+            renderInvoicesTable(tbodyId, data.invoices || []);
+          } catch (error) {
+            document.getElementById(tbodyId).innerHTML = '<tr><td class="muted" style="padding:6px" colspan="8">Unable to load invoices.</td></tr>';
+          }
+        }
+
+        const allInvoicesBtn = document.querySelector('[data-target="invoices-all"]');
+        const paidInvoicesBtn = document.querySelector('[data-target="invoices-payments"]');
+        if (allInvoicesBtn) allInvoicesBtn.addEventListener('click', function () { loadInvoices('allInvoicesBody'); });
+        if (paidInvoicesBtn) paidInvoicesBtn.addEventListener('click', function () { loadInvoices('paidInvoicesBody', 'paid'); });
+      })();
+
+      if (session.role === 'developer') {
+        const currencyNames = { '840': 'USD', '356': 'INR', '064': 'BTN' };
+        const unassignedMidPicker = document.getElementById('unassignedMidPicker');
+        const merchantsTableBody = document.getElementById('merchantsTableBody');
+        const newMerchantLogo = wireLogoUpload('newMerchantLogoFile', 'newMerchantLogoUrl', 'newMerchantLogoPreview');
+
+        function renderUnassignedPicker(unassigned) {
+          const byCurrency = {};
+          unassigned.forEach(function (item) {
+            if (!byCurrency[item.currency]) byCurrency[item.currency] = [];
+            byCurrency[item.currency].push(item.merchantId);
+          });
+          const codes = Object.keys(byCurrency);
+          if (!codes.length) {
+            unassignedMidPicker.innerHTML = '<span class="muted">No unassigned merchant IDs available.</span>';
+            return;
+          }
+          unassignedMidPicker.innerHTML = codes.map(function (code) {
+            const label = currencyNames[code] || code;
+            const options = byCurrency[code].map(function (mid) {
+              return '<option value="' + mid + '">' + mid + '</option>';
+            }).join('');
+            return '<div style="margin-bottom:6px"><label style="display:inline-block;width:70px;font-weight:700">' + label + '</label>' +
+              '<select data-currency="' + code + '" class="mid-select"><option value="">-- none --</option>' + options + '</select></div>';
+          }).join('');
+        }
+
+        function renderMerchantsTable(merchants) {
+          if (!merchants.length) {
+            merchantsTableBody.innerHTML = '<tr><td class="muted" style="padding:6px" colspan="4">No merchants yet.</td></tr>';
+            return;
+          }
+          merchantsTableBody.innerHTML = merchants.map(function (m) {
+            const map = m.merchantIdsByCurrency || {};
+            return '<tr style="border-top:1px solid #e2e8f0">' +
+              '<td style="padding:6px">' + m.username + '</td>' +
+              '<td style="padding:6px">' + m.displayName + '</td>' +
+              '<td style="padding:6px">' + (map['840'] || '—') + '</td>' +
+              '<td style="padding:6px">' + (map['356'] || '—') + '</td>' +
+              '</tr>';
+          }).join('');
+        }
+
+        async function loadDeveloperData() {
+          try {
+            const res = await fetch('/api/developer/merchants', { headers: { 'Accept': 'application/json' } });
+            const data = await res.json().catch(function () { return {}; });
+            renderUnassignedPicker(data.unassigned || []);
+            renderMerchantsTable(data.merchants || []);
+          } catch (error) {
+            unassignedMidPicker.textContent = 'Unable to load available merchant IDs.';
+          }
+        }
+
+        document.getElementById('addMerchantForm').addEventListener('submit', async function (event) {
+          event.preventDefault();
+          const msg = document.getElementById('addMerchantMsg');
+          const credBox = document.getElementById('generatedCredentials');
+          credBox.style.display = 'none';
+
+          const selections = {};
+          document.querySelectorAll('.mid-select').forEach(function (sel) {
+            if (sel.value) selections[sel.getAttribute('data-currency')] = sel.value;
+          });
+          if (!Object.keys(selections).length) {
+            msg.textContent = 'Select at least one merchant ID.';
+            return;
+          }
+
+          msg.textContent = 'Creating...';
+          try {
+            const res = await fetch('/api/developer/merchants', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+              body: JSON.stringify({
+                username: document.getElementById('newMerchantUsername').value.trim(),
+                displayName: document.getElementById('newMerchantDisplayName').value.trim(),
+                merchantName: document.getElementById('newMerchantCompanyName').value.trim(),
+                email: document.getElementById('newMerchantEmail').value.trim(),
+                phone: document.getElementById('newMerchantPhone').value.trim(),
+                logoUrl: newMerchantLogo.getValue(),
+                selections: selections
+              })
+            });
+            const data = await res.json().catch(function () { return {}; });
+            if (!res.ok) throw new Error(data.error || 'Unable to create merchant.');
+
+            msg.textContent = 'Merchant created.';
+            document.getElementById('generatedCredentialsBody').textContent =
+              'Username: ' + data.username + '   Password: ' + data.generatedPassword;
+            credBox.style.display = 'block';
+            document.getElementById('addMerchantForm').reset();
+            newMerchantLogo.reset();
+            loadDeveloperData();
+          } catch (error) {
+            msg.textContent = error.message || 'Error creating merchant.';
+          }
+        });
+
+        loadDeveloperData();
+      }
+    })();
+  </script>
+</body>
+</html>`;
+}
+
 
 function appendResultParams(targetUrl, { txnId, status }) {
   try {
@@ -1578,14 +2424,365 @@ function appendResultParams(targetUrl, { txnId, status }) {
   }
 }
 
+async function handleLogin(req, res) {
+  const raw = await parseBody(req);
+  const contentType = (req.headers['content-type'] || '').toLowerCase();
+  const input = parseRawPayload(raw, contentType);
+
+  const usernameInput = String(input.username || '').trim();
+  const passwordInput = String(input.password || '').trim();
+
+  if (!usernameInput || !passwordInput) {
+    return json(res, 400, { error: 'username and password are required' });
+  }
+
+  const users = await loadMerchantUserDb();
+  const usernameKey = usernameInput.toLowerCase();
+  const usernameAsMid = normalizeMerchantId(usernameInput);
+  let user = users.get(usernameKey);
+
+  if (!user) {
+    for (const candidate of users.values()) {
+      const displayKey = String(candidate.displayName || '').trim().toLowerCase();
+      const candidateMid = normalizeMerchantId(candidate.merchantId);
+      if (displayKey === usernameKey || (usernameAsMid && candidateMid === usernameAsMid)) {
+        user = candidate;
+        break;
+      }
+    }
+  }
+
+  if (!user || !verifyPassword(passwordInput, user.passwordHash, user.passwordSalt)) {
+    return json(res, 401, { error: 'Invalid username or password' });
+  }
+
+  const token = crypto.randomBytes(24).toString('base64url');
+  const createdAt = new Date();
+  const expiresAt = new Date(createdAt.getTime() + SESSION_TTL_MS);
+  sessionStore.set(token, {
+    token,
+    username: user.username,
+    displayName: user.displayName,
+    role: user.role,
+    merchantId: user.merchantId,
+    merchantIdsByCurrency: user.merchantIdsByCurrency,
+    defaultCurrency: user.defaultCurrency,
+    createdAt: createdAt.toISOString(),
+    expiresAt: expiresAt.toISOString(),
+  });
+
+  setSessionCookie(res, token, Math.floor(SESSION_TTL_MS / 1000));
+  return json(res, 200, {
+    ok: true,
+    user: buildSessionClientView(sessionStore.get(token)),
+    expiresAt: expiresAt.toISOString(),
+  });
+}
+
+function handleLogout(req, res) {
+  const token = getSessionTokenFromRequest(req);
+  if (token) sessionStore.delete(token);
+  clearSessionCookie(res);
+  return json(res, 200, { ok: true });
+}
+
+function handleSessionInfo(req, res) {
+  const session = getAuthenticatedSession(req);
+  if (!session) {
+    return json(res, 401, { authenticated: false });
+  }
+
+  return json(res, 200, {
+    authenticated: true,
+    user: buildSessionClientView(session),
+    expiresAt: session.expiresAt,
+  });
+}
+
+async function handleChangePassword(req, res) {
+  const session = getAuthenticatedSession(req);
+  if (!session) return json(res, 401, { error: 'Login required' });
+
+  const raw = await parseBody(req);
+  const contentType = (req.headers['content-type'] || '').toLowerCase();
+  const input = parseRawPayload(raw, contentType);
+
+  const currentPassword = String(input.currentPassword || '');
+  const newPassword = String(input.newPassword || '');
+
+  if (!currentPassword || !newPassword) {
+    return json(res, 400, { error: 'currentPassword and newPassword are required' });
+  }
+  if (newPassword.length < 8) {
+    return json(res, 400, { error: 'New password must be at least 8 characters' });
+  }
+
+  const users = await loadMerchantUserDbRaw();
+  const usernameKey = findUsernameKey(users, session.username);
+  if (!usernameKey) return json(res, 404, { error: 'Account not found' });
+
+  const record = users[usernameKey];
+  if (!verifyPassword(currentPassword, record.passwordHash, record.passwordSalt)) {
+    return json(res, 401, { error: 'Current password is incorrect' });
+  }
+
+  const { hash, salt } = hashPassword(newPassword);
+  record.passwordHash = hash;
+  record.passwordSalt = salt;
+  await saveMerchantUserDbRaw(users);
+
+  return json(res, 200, { ok: true });
+}
+
+async function handleChangeUsername(req, res) {
+  const session = getAuthenticatedSession(req);
+  if (!session) return json(res, 401, { error: 'Login required' });
+
+  const raw = await parseBody(req);
+  const contentType = (req.headers['content-type'] || '').toLowerCase();
+  const input = parseRawPayload(raw, contentType);
+
+  const newUsername = String(input.newUsername || '').trim();
+  const currentPassword = String(input.currentPassword || '');
+
+  if (!newUsername || !currentPassword) {
+    return json(res, 400, { error: 'newUsername and currentPassword are required' });
+  }
+  if (!/^[A-Za-z0-9_.-]{3,40}$/.test(newUsername)) {
+    return json(res, 400, { error: 'Username must be 3-40 characters (letters, numbers, _ . -)' });
+  }
+
+  const users = await loadMerchantUserDbRaw();
+  const oldUsernameKey = findUsernameKey(users, session.username);
+  if (!oldUsernameKey) return json(res, 404, { error: 'Account not found' });
+
+  const record = users[oldUsernameKey];
+  if (!verifyPassword(currentPassword, record.passwordHash, record.passwordSalt)) {
+    return json(res, 401, { error: 'Current password is incorrect' });
+  }
+
+  const collision = findUsernameKey(users, newUsername);
+  if (collision && collision.toLowerCase() !== oldUsernameKey.toLowerCase()) {
+    return json(res, 409, { error: 'Username already taken' });
+  }
+
+  if (newUsername.toLowerCase() !== oldUsernameKey.toLowerCase() || newUsername !== oldUsernameKey) {
+    if (record.displayName === oldUsernameKey) record.displayName = newUsername;
+    delete users[oldUsernameKey];
+    users[newUsername] = record;
+    await saveMerchantUserDbRaw(users);
+
+    const portalDb = await loadMerchantPortalDb();
+    if (portalDb[oldUsernameKey]) {
+      portalDb[newUsername] = portalDb[oldUsernameKey];
+      delete portalDb[oldUsernameKey];
+      await saveMerchantPortalDb(portalDb);
+    }
+  }
+
+  const token = getSessionTokenFromRequest(req);
+  if (token) sessionStore.delete(token);
+  clearSessionCookie(res);
+
+  return json(res, 200, { ok: true, newUsername });
+}
+
+async function handleUpdateMerchantProfile(req, res) {
+  const session = getAuthenticatedSession(req);
+  if (!session) return json(res, 401, { error: 'Login required' });
+
+  const raw = await parseBody(req);
+  const contentType = (req.headers['content-type'] || '').toLowerCase();
+  const input = parseRawPayload(raw, contentType);
+
+  const merchantName = String(input.merchantName || '').trim();
+  const address = String(input.address || '').trim();
+  const email = String(input.email || '').trim();
+  const phone = String(input.phone || '').trim();
+  const logoUrl = String(input.logoUrl || '').trim();
+  const useCustomerNames = !!input.useCustomerNames;
+  const sendInvoiceViaEmail = !!input.sendInvoiceViaEmail;
+  const allowExternalPayments = !!input.allowExternalPayments;
+  const paymentMessage = String(input.paymentMessage || '').trim();
+  const successfulPaymentMessage = String(input.successfulPaymentMessage || '').trim();
+  const termsAndConditions = String(input.termsAndConditions || '').trim();
+
+  if (!merchantName) {
+    return json(res, 400, { error: 'Merchant name is required' });
+  }
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return json(res, 400, { error: 'Invalid email address' });
+  }
+  const logoError = validateLogoUrl(logoUrl);
+  if (logoError) {
+    return json(res, 400, { error: logoError });
+  }
+
+  const sessionView = buildSessionClientView(session);
+  const portalDb = await loadMerchantPortalDb();
+  const usernameKey = session.username;
+  const defaultModel = buildDefaultPortalModel(sessionView);
+  const existing = mergePortalModel(defaultModel, portalDb[usernameKey] || null);
+
+  const updated = {
+    ...existing,
+    merchantName,
+    address,
+    email,
+    phone,
+    logoUrl,
+    settings: {
+      ...existing.settings,
+      useCustomerNames,
+      sendInvoiceViaEmail,
+      allowExternalPayments,
+      paymentMessage,
+      successfulPaymentMessage,
+      termsAndConditions,
+    },
+  };
+
+  portalDb[usernameKey] = updated;
+  await saveMerchantPortalDb(portalDb);
+
+  return json(res, 200, { ok: true, profile: updated });
+}
+
+async function getUnassignedMerchantIds() {
+  const currencyDb = await loadMerchantCurrencyDb();
+  const users = await loadMerchantUserDbRaw();
+  const claimed = new Set();
+
+  for (const rec of Object.values(users)) {
+    const map = rec && typeof rec === 'object' ? rec.merchantIdsByCurrency : null;
+    if (map && typeof map === 'object') {
+      for (const mid of Object.values(map)) {
+        const normalized = normalizeMerchantId(mid);
+        if (normalized) claimed.add(normalized);
+      }
+    }
+  }
+
+  const unassigned = [];
+  for (const [merchantId, currency] of currencyDb.entries()) {
+    if (!claimed.has(merchantId)) unassigned.push({ merchantId, currency });
+  }
+  return unassigned;
+}
+
+async function handleListDeveloperMerchants(req, res) {
+  const session = getAuthenticatedSession(req);
+  if (!session || session.role !== 'developer') {
+    return json(res, 403, { error: 'Developer access required' });
+  }
+
+  const users = await loadMerchantUserDbRaw();
+  const merchants = Object.entries(users)
+    .filter(([, rec]) => String(rec?.role || 'merchant').toLowerCase() !== 'developer')
+    .map(([username, rec]) => ({
+      username,
+      displayName: String(rec?.displayName || username),
+      merchantIdsByCurrency: rec?.merchantIdsByCurrency && typeof rec.merchantIdsByCurrency === 'object' ? rec.merchantIdsByCurrency : {},
+    }));
+
+  const unassigned = await getUnassignedMerchantIds();
+
+  return json(res, 200, { merchants, unassigned });
+}
+
+async function handleCreateDeveloperMerchant(req, res) {
+  const session = getAuthenticatedSession(req);
+  if (!session || session.role !== 'developer') {
+    return json(res, 403, { error: 'Developer access required' });
+  }
+
+  const raw = await parseBody(req);
+  const contentType = (req.headers['content-type'] || '').toLowerCase();
+  const input = parseRawPayload(raw, contentType);
+
+  const username = String(input.username || '').trim();
+  const displayName = String(input.displayName || username).trim() || username;
+  const merchantName = String(input.merchantName || displayName).trim() || displayName;
+  const email = String(input.email || '').trim();
+  const phone = String(input.phone || '').trim();
+  const logoUrl = String(input.logoUrl || '').trim();
+  const selectionsInput = input.selections && typeof input.selections === 'object' ? input.selections : {};
+
+  if (!username || !/^[A-Za-z0-9_.-]{3,40}$/.test(username)) {
+    return json(res, 400, { error: 'Username must be 3-40 characters (letters, numbers, _ . -)' });
+  }
+  const logoError = validateLogoUrl(logoUrl);
+  if (logoError) {
+    return json(res, 400, { error: logoError });
+  }
+
+  const users = await loadMerchantUserDbRaw();
+  if (findUsernameKey(users, username)) {
+    return json(res, 409, { error: 'Username already taken' });
+  }
+
+  const unassigned = await getUnassignedMerchantIds();
+  const unassignedByMid = new Map(unassigned.map(entry => [entry.merchantId, entry.currency]));
+
+  const merchantIdsByCurrency = {};
+  for (const [currencyRaw, midRaw] of Object.entries(selectionsInput)) {
+    const currency = normalizeCurrency(currencyRaw);
+    const merchantId = normalizeMerchantId(midRaw);
+    if (!currency || !merchantId) continue;
+
+    const actualCurrency = unassignedByMid.get(merchantId);
+    if (!actualCurrency || actualCurrency !== currency) {
+      return json(res, 400, { error: `Merchant ID ${merchantId} is not available for currency ${currency}` });
+    }
+    merchantIdsByCurrency[currency] = merchantId;
+  }
+
+  const selectedCount = Object.keys(merchantIdsByCurrency).length;
+  if (selectedCount < 1 || selectedCount > 2) {
+    return json(res, 400, { error: 'Select 1 or 2 merchant IDs for the new merchant' });
+  }
+
+  const generatedPassword = crypto.randomBytes(9).toString('base64url');
+  const { hash, salt } = hashPassword(generatedPassword);
+  const defaultCurrency = merchantIdsByCurrency['840'] ? '840' : Object.keys(merchantIdsByCurrency)[0];
+
+  users[username] = {
+    passwordHash: hash,
+    passwordSalt: salt,
+    displayName,
+    role: 'merchant',
+    defaultCurrency,
+    merchantIdsByCurrency,
+  };
+  await saveMerchantUserDbRaw(users);
+
+  const portalDb = await loadMerchantPortalDb();
+  const defaultModel = buildDefaultPortalModel({ displayName, username, merchantIdsByCurrency });
+  portalDb[username] = {
+    ...defaultModel,
+    merchantName,
+    email,
+    phone,
+    logoUrl,
+  };
+  await saveMerchantPortalDb(portalDb);
+
+  return json(res, 201, {
+    ok: true,
+    username,
+    generatedPassword,
+    merchantIdsByCurrency,
+  });
+}
+
 async function handleInitiate(req, res) {
   const raw = await parseBody(req);
   const contentType = (req.headers['content-type'] || '').toLowerCase();
   const input = parseRawPayload(raw, contentType);
 
-  const merchantId = String(input.merchantId || MERCHANT_ID_DEFAULT || '').trim();
+  const requestedCurrency = normalizeCurrency(input.currency);
+  const session = getAuthenticatedSession(req);
   const amount = String(input.amount || '').trim();
-  const currencyInput = String(input.currency || '').trim();
   const orderRefInput = String(input.orderRef || '').trim();
   const customerRefInput = String(input.customerRef || '').trim();
   const customerName = String(input.customerName || '').trim();
@@ -1598,6 +2795,39 @@ async function handleInitiate(req, res) {
   const txnId = String(input.txnId || generateTxnId()).trim();
   const orderRef = orderRefInput || `ORD-${txnId}`;
   const customerRef = customerRefInput || `CUST-${txnId.slice(-8)}`;
+
+  let merchantId = '';
+  let routingCurrency = requestedCurrency;
+
+  let paymentLink = null;
+  if (paymentLinkToken) {
+    paymentLink = await getPaymentLink(paymentLinkToken);
+    if (!paymentLink) {
+      return html(res, 404, renderMessagePage('Payment link not found', 'This payment link is invalid or expired.'));
+    }
+    if (paymentLink.expiresAt && Date.parse(paymentLink.expiresAt) < Date.now()) {
+      return html(res, 410, renderMessagePage('Payment link expired', 'This payment link has expired. Please request a new one.'));
+    }
+    merchantId = String(paymentLink.merchantId || '').trim();
+    routingCurrency = normalizeCurrency(paymentLink.currency) || routingCurrency;
+  } else if (session) {
+    const routing = getSessionMerchantRouting(session, requestedCurrency);
+    if (!routing || !routing.merchantId) {
+      return html(
+        res,
+        403,
+        renderMessagePage('Merchant mapping missing', 'No merchant ID is mapped for this login. Contact administrator.')
+      );
+    }
+    merchantId = routing.merchantId;
+    routingCurrency = routing.currency || routingCurrency;
+  } else {
+    return html(
+      res,
+      401,
+      renderMessagePage('Login required', 'Please login first to access the payment portal.', { loginUrl: '/login' })
+    );
+  }
 
   const missing = [];
   if (!merchantId) missing.push('merchantId');
@@ -1628,8 +2858,8 @@ async function handleInitiate(req, res) {
     return html(res, 400, renderMessagePage('Invalid amount', error.message, { amount }));
   }
 
-  const currencyResolved = normalizeCurrency(currencyInput)
-    ? { currency: normalizeCurrency(currencyInput), source: 'request' }
+  const currencyResolved = normalizeCurrency(routingCurrency)
+    ? { currency: normalizeCurrency(routingCurrency), source: 'routing' }
     : await resolveMerchantCurrency(merchantId);
   const currency = currencyResolved.currency;
 
@@ -1660,8 +2890,8 @@ async function handleInitiate(req, res) {
       merchantPrivateKeyPem: keys.privateKeyPem,
     });
   } catch (error) {
-    console.error('[Cardzone][initiate] mkReq failed:', error.message);
-    return html(res, 502, renderMessagePage('Unable to start payment', error.message));
+    console.error('[Cardzone][initiate] mkReq failed:', error.message, error.cause ? JSON.stringify(error.cause) : '');
+    return html(res, 502, renderMessagePage('Unable to start payment', error.message, error.cause ? { cause: String(error.cause.code || error.cause.message || error.cause) } : undefined));
   }
 
   const mkReqRes = mkReq.responsePayload;
@@ -1711,6 +2941,7 @@ async function handleInitiate(req, res) {
     currency,
     initiationSource,
     paymentLinkToken: paymentLinkToken || null,
+    username: session?.username || null,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     successReturnUrl,
@@ -1738,6 +2969,63 @@ async function handleInitiate(req, res) {
 
   await saveTransaction(tx);
   return html(res, 200, renderAutoPostPage(mercReqUrl, mpiReq));
+}
+
+async function finalizeTransactionOutcome(tx, effectiveStatus, finalResult) {
+  if (effectiveStatus !== 'SUCCESS' && effectiveStatus !== 'FAILED') {
+    return { customSuccessMessage: '' };
+  }
+
+  let invoice = null;
+  let customSuccessMessage = '';
+  try {
+    if (tx.paymentLinkToken) {
+      const paymentLink = await getPaymentLink(tx.paymentLinkToken);
+      if (paymentLink?.invoiceNumber) {
+        invoice = await getInvoice(paymentLink.invoiceNumber);
+        if (invoice && invoice.status === 'pending') {
+          const newStatus = effectiveStatus === 'SUCCESS' ? 'paid' : 'failed';
+          await updateInvoiceStatus(invoice._id, newStatus);
+        }
+        if (invoice && effectiveStatus === 'SUCCESS') {
+          customSuccessMessage = invoice.successMessage || '';
+        }
+      }
+    }
+  } catch (error) {
+    console.error('[Cardzone][finalize] invoice status update failed for txn', tx.txnId, error.message);
+  }
+
+  try {
+    await saveTransactionHistory({
+      _id: tx.txnId,
+      orderRef: tx.orderRef || null,
+      customerRef: tx.customerRef || null,
+      customerName: tx.customerName || null,
+      merchantId: tx.merchantId || null,
+      currency: tx.currency || null,
+      amountMajor: tx.amountMajor || null,
+      amountMinor: tx.amountMinor || null,
+      status: effectiveStatus === 'SUCCESS' ? 'paid' : 'failed',
+      responseCode: finalResult?.responseCode || null,
+      responseReason: finalResult?.responseReason || null,
+      authorizationCode: finalResult?.authorizationCode || null,
+      referenceNumber: finalResult?.referenceNumber || null,
+      bin: finalResult?.bin || null,
+      referralCode: finalResult?.referralCode || null,
+      resultSource: finalResult?.source || null,
+      invoiceNumber: invoice?._id || null,
+      username: invoice?.username || tx.username || null,
+      initiationSource: tx.initiationSource || null,
+      createdAt: tx.createdAt || null,
+      resolvedAt: finalResult?.resolvedAt || new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error('[Cardzone][finalize] saving transaction history failed for txn', tx.txnId, error.message);
+  }
+
+  return { customSuccessMessage };
 }
 
 async function handleCallback(req, res) {
@@ -1852,7 +3140,8 @@ async function handleCallback(req, res) {
     );
   }
 
-  return html(res, 200, renderResultPage(tx, finalStatus, finalResult));
+  const { customSuccessMessage } = await finalizeTransactionOutcome(tx, finalStatus, finalResult);
+  return html(res, 200, renderResultPage(tx, finalStatus, finalResult, getRequestBaseUrl(req), customSuccessMessage));
 }
 
 async function handleReturn(req, res) {
@@ -1899,7 +3188,7 @@ async function handleReturn(req, res) {
     });
   }
 
-  if (callbackReceived && (!callbackResultTrusted || !hasSufficientFinalResult(finalResult))) {
+  if (!callbackReceived || !callbackResultTrusted || !hasSufficientFinalResult(finalResult)) {
     try {
       const inquiry = await doInquiry(tx, tx.txnId);
       tx.inquiry = inquiry;
@@ -1957,7 +3246,18 @@ async function handleReturn(req, res) {
     );
   }
 
-  return html(res, 200, renderResultPage(tx, effectiveStatus, finalResult, getRequestBaseUrl(req)));
+  const { customSuccessMessage } = await finalizeTransactionOutcome(tx, effectiveStatus, finalResult);
+
+  if (effectiveStatus === 'SUCCESS' && tx.successReturnUrl) {
+    const redirectUrl = appendResultParams(tx.successReturnUrl, { txnId: tx.txnId, status: effectiveStatus });
+    if (redirectUrl) return redirect(res, redirectUrl);
+  }
+  if (effectiveStatus === 'FAILED' && tx.failReturnUrl) {
+    const redirectUrl = appendResultParams(tx.failReturnUrl, { txnId: tx.txnId, status: effectiveStatus });
+    if (redirectUrl) return redirect(res, redirectUrl);
+  }
+
+  return html(res, 200, renderResultPage(tx, effectiveStatus, finalResult, getRequestBaseUrl(req), customSuccessMessage));
 }
 
 async function handleTxDebug(req, res, txnId) {
@@ -2008,11 +3308,18 @@ async function handleMerchantCurrency(req, res) {
 }
 
 async function handleCreatePaymentLink(req, res) {
+  const session = getAuthenticatedSession(req);
+  if (!session) {
+    return json(res, 401, { error: 'Login required' });
+  }
+
   const raw = await parseBody(req);
   const contentType = (req.headers['content-type'] || '').toLowerCase();
   const input = parseRawPayload(raw, contentType);
 
-  const merchantId = String(input.merchantId || '').trim();
+  const requestedCurrency = normalizeCurrency(input.currency);
+  const routing = getSessionMerchantRouting(session, requestedCurrency);
+  const merchantId = String(routing?.merchantId || '').trim();
   const amount = String(input.amount || '').trim();
   const customerName = String(input.customerName || '').trim();
   const email = String(input.email || '').trim();
@@ -2028,9 +3335,8 @@ async function handleCreatePaymentLink(req, res) {
     return json(res, 400, { error: error.message });
   }
 
-  const currencyInput = String(input.currency || '').trim();
-  const currencyResolved = normalizeCurrency(currencyInput)
-    ? { currency: normalizeCurrency(currencyInput), source: 'request' }
+  const currencyResolved = normalizeCurrency(routing?.currency)
+    ? { currency: normalizeCurrency(routing.currency), source: 'session-routing' }
     : await resolveMerchantCurrency(merchantId);
 
   if (!currencyResolved.currency) {
@@ -2067,6 +3373,259 @@ async function handleCreatePaymentLink(req, res) {
   });
 }
 
+async function handleCreateInvoice(req, res) {
+  const session = getAuthenticatedSession(req);
+  if (!session) return json(res, 401, { error: 'Login required' });
+
+  const raw = await parseBody(req);
+  const contentType = (req.headers['content-type'] || '').toLowerCase();
+  const input = parseRawPayload(raw, contentType);
+
+  const requestedCurrency = normalizeCurrency(input.currency);
+  const routing = getSessionMerchantRouting(session, requestedCurrency);
+  const merchantId = String(routing?.merchantId || '').trim();
+  const currency = normalizeCurrency(routing?.currency);
+  const amount = String(input.amount || '').trim();
+  const customerName = String(input.customerName || '').trim();
+  const customerMessageInput = String(input.customerMessage || '').trim();
+
+  if (!merchantId || !currency) {
+    return json(res, 400, { error: 'No merchant mapping available for the selected currency' });
+  }
+  if (!amount) return json(res, 400, { error: 'Amount is required' });
+  if (!customerName) return json(res, 400, { error: 'Customer name is required' });
+
+  try {
+    amountToMinorUnits(amount);
+  } catch (error) {
+    return json(res, 400, { error: error.message });
+  }
+
+  const sessionView = buildSessionClientView(session);
+  const portalModel = await getPortalModelForSession(sessionView);
+  const customerMessage = customerMessageInput || portalModel.settings?.paymentMessage || '';
+  const termsAndConditions = portalModel.settings?.termsAndConditions || '';
+  const successMessage = portalModel.settings?.successfulPaymentMessage || '';
+  const dueDate = new Date(Date.now() + INVOICE_DEFAULT_DUE_MS);
+
+  const invoiceNumber = await nextInvoiceNumber();
+  const linkToken = generatePaymentLinkToken();
+  const createdAt = new Date();
+  const baseUrl = getRequestBaseUrl(req);
+
+  await savePaymentLink({
+    token: linkToken,
+    merchantId,
+    amount,
+    currency,
+    customerName,
+    invoiceNumber,
+    createdAt: createdAt.toISOString(),
+    expiresAt: dueDate.toISOString(),
+  });
+
+  const invoice = {
+    _id: invoiceNumber,
+    username: session.username,
+    merchantName: portalModel.merchantName || session.displayName || session.username,
+    currency,
+    merchantId,
+    amount,
+    customerName,
+    customerMessage,
+    termsAndConditions,
+    successMessage,
+    invoiceDate: createdAt.toISOString(),
+    dueDate: dueDate.toISOString(),
+    status: 'pending',
+    paymentLinkToken: linkToken,
+    txnId: null,
+    createdAt: createdAt.toISOString(),
+    updatedAt: createdAt.toISOString(),
+  };
+
+  await saveInvoice(invoice);
+
+  return json(res, 201, {
+    ok: true,
+    invoice,
+    paymentUrl: `${baseUrl}/pay/${encodeURIComponent(linkToken)}`,
+  });
+}
+
+async function handleListInvoices(req, res) {
+  const session = getAuthenticatedSession(req);
+  if (!session) return json(res, 401, { error: 'Login required' });
+
+  const u = new URL(req.url, `http://${req.headers.host}`);
+  const statusFilter = String(u.searchParams.get('status') || '').trim().toLowerCase();
+
+  const invoices = await listInvoicesForUsername(session.username, statusFilter || undefined);
+  return json(res, 200, { invoices });
+}
+
+async function handleDownloadInvoicePdf(req, res, invoiceNumber) {
+  const session = getAuthenticatedSession(req);
+  if (!session) return json(res, 401, { error: 'Login required' });
+
+  const invoice = await getInvoice(invoiceNumber);
+  if (!invoice || invoice.username !== session.username) {
+    return json(res, 404, { error: 'Invoice not found' });
+  }
+
+  const pdfBuffer = await generateInvoicePdfBuffer(invoice);
+  res.statusCode = 200;
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename="${invoice._id}.pdf"`);
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Content-Length', String(pdfBuffer.length));
+  return res.end(pdfBuffer);
+}
+
+function renderInvoiceReviewPage(invoice, merchantProfile, hiddenFields) {
+  const CURRENCY_NAMES = { '840': 'USD', '356': 'INR', '064': 'BTN' };
+  const currencyDisplay = CURRENCY_NAMES[invoice.currency] || invoice.currency || '';
+  const amountFormatted = `${currencyDisplay ? `${currencyDisplay} ` : ''}${Number.parseFloat(invoice.amount || 0).toFixed(2)}`;
+  const merchantName = invoice.merchantName || 'Merchant';
+  const logoUrl = String(merchantProfile?.logoUrl || '').trim();
+  const address = String(merchantProfile?.address || '').trim();
+  const addressLines = address ? address.split('\n').filter(Boolean) : [];
+  const hasTerms = !!invoice.termsAndConditions;
+
+  const fmtDate = (iso) => {
+    try {
+      return new Date(iso).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+    } catch {
+      return iso || '—';
+    }
+  };
+
+  const inputs = Object.entries(hiddenFields)
+    .filter(([, v]) => v !== undefined && v !== null && v !== '')
+    .map(([k, v]) => `<input type="hidden" name="${escapeHtml(k)}" value="${escapeHtml(v)}">`)
+    .join('\n');
+
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Invoice ${escapeHtml(invoice._id)}</title>
+  <style>
+    :root{--bg:#eef1f2;--card:#ffffff;--text:#1f2937;--muted:#64748b;--brand:#2f7a3d;--accent:#22c55e;--accent-2:#16a34a;--border:#e5e7eb}
+    *{box-sizing:border-box}
+    body{margin:0;font-family:Segoe UI,Arial,sans-serif;color:var(--text);background:var(--bg);min-height:100vh;padding:28px 14px}
+    .container{width:100%;max-width:640px;margin:0 auto}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:6px;box-shadow:0 4px 18px rgba(15,23,42,.06);overflow:hidden}
+    .letterhead{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;padding:24px 28px;border-bottom:1px solid var(--border)}
+    .brand-logo{max-height:60px;max-width:220px;object-fit:contain}
+    .brand-name{font-size:26px;font-weight:700;color:var(--brand);font-family:Georgia,'Times New Roman',serif}
+    .brand-address{text-align:right;font-size:12.5px;color:#334155;line-height:1.5}
+    .brand-address .addr-name{font-weight:700}
+    .greeting{background:#f8fafc;padding:18px 28px;font-size:13.5px;color:#334155}
+    .greeting p{margin:0 0 8px}
+    .greeting p:last-child{margin-bottom:0}
+    .body{padding:22px 28px}
+    .section-title{font-size:13px;font-weight:700;color:#334155;margin-bottom:8px}
+    .kv-plain{display:grid;grid-template-columns:160px 1fr;border-top:1px solid var(--border);font-size:13px}
+    .kv-plain:first-of-type{border-top:0}
+    .kv-plain div{padding:9px 0}
+    .kv-plain .k{color:#64748b}
+    .kv-plain .v{font-weight:700}
+    .agree{display:flex;align-items:flex-start;gap:8px;margin-top:18px;font-size:13px;color:#334155}
+    .agree input{margin-top:3px}
+    .agree a{color:var(--brand);font-weight:700;text-decoration:underline;cursor:pointer}
+    .continue-btn{width:100%;border:0;border-radius:8px;padding:13px 16px;background:var(--accent);color:#fff;font-weight:700;font-size:15px;cursor:pointer;margin-top:16px}
+    .continue-btn:hover{background:var(--accent-2)}
+    .continue-btn:disabled{opacity:.5;cursor:not-allowed}
+    .disclaimer{margin-top:12px;font-size:11.5px;color:var(--muted);line-height:1.6}
+    .terms-modal{position:fixed;inset:0;background:rgba(15,23,42,.5);display:flex;align-items:center;justify-content:center;padding:20px;z-index:10}
+    .terms-modal-inner{background:#fff;border-radius:10px;max-width:520px;width:100%;max-height:70vh;display:flex;flex-direction:column;padding:20px}
+    .terms-modal-inner h3{margin:0 0 12px;font-size:16px}
+    .terms-modal-body{overflow:auto;font-size:13px;color:#334155;white-space:pre-wrap;flex:1}
+    .terms-modal-inner button{margin-top:14px;align-self:flex-end;border:0;border-radius:8px;padding:8px 16px;background:var(--accent);color:#fff;font-weight:700;cursor:pointer}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <section class="card">
+      <div class="letterhead">
+        <div>
+          ${logoUrl ? `<img src="${escapeHtml(logoUrl)}" alt="${escapeHtml(merchantName)}" class="brand-logo" />` : `<div class="brand-name">${escapeHtml(merchantName)}</div>`}
+        </div>
+        <div class="brand-address">
+          <div class="addr-name">${escapeHtml(merchantName)}</div>
+          ${addressLines.map(line => `<div>${escapeHtml(line)}</div>`).join('')}
+        </div>
+      </div>
+
+      <div class="greeting">
+        <p>Dear ${escapeHtml(invoice.customerName || 'Customer')},</p>
+        <p>${escapeHtml(merchantName)} has requested a payment from you.</p>
+        ${invoice.customerMessage ? `<p>${escapeHtml(invoice.customerMessage)}</p>` : ''}
+      </div>
+
+      <div class="body">
+        <div class="section-title">Payment Details</div>
+        <div class="kv-plain"><div class="k">Dated</div><div class="v">${escapeHtml(fmtDate(invoice.invoiceDate))}</div></div>
+        <div class="kv-plain"><div class="k">Invoice#</div><div class="v">${escapeHtml(invoice._id)}</div></div>
+        <div class="kv-plain"><div class="k">Total Amount</div><div class="v">${escapeHtml(amountFormatted)}</div></div>
+
+        <form id="payForm" method="post" action="/api/initiate">${inputs}
+          <label class="agree">
+            <input type="checkbox" id="agreeBox" ${hasTerms ? '' : 'checked style="display:none"'} />
+            <span>I agree to the ${hasTerms ? `<a id="termsLink">Terms and Conditions</a>` : 'Terms and Conditions'} of ${escapeHtml(merchantName)}</span>
+          </label>
+          <button type="submit" id="proceedBtn" class="continue-btn" ${hasTerms ? 'disabled' : ''}>Continue</button>
+        </form>
+        <div class="disclaimer">
+          <p>&#9888; Make sure you confirm that the payment details are correct before proceeding.</p>
+          <p>After clicking &quot;Continue&quot; you will be redirected to a secure payment page.</p>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  ${hasTerms ? `
+  <div id="termsModal" class="terms-modal" style="display:none">
+    <div class="terms-modal-inner">
+      <h3>Terms and Conditions of ${escapeHtml(merchantName)}</h3>
+      <div class="terms-modal-body">${escapeHtml(invoice.termsAndConditions)}</div>
+      <button type="button" id="closeTermsModal">Close</button>
+    </div>
+  </div>
+  ` : ''}
+
+  <script>
+    (function () {
+      const agreeBox = document.getElementById('agreeBox');
+      const proceedBtn = document.getElementById('proceedBtn');
+      if (agreeBox && proceedBtn) {
+        agreeBox.addEventListener('change', function () {
+          proceedBtn.disabled = !agreeBox.checked;
+        });
+      }
+
+      const termsLink = document.getElementById('termsLink');
+      const termsModal = document.getElementById('termsModal');
+      const closeTermsModal = document.getElementById('closeTermsModal');
+      if (termsLink && termsModal) {
+        termsLink.addEventListener('click', function (event) {
+          event.preventDefault();
+          termsModal.style.display = 'flex';
+        });
+      }
+      if (closeTermsModal && termsModal) {
+        closeTermsModal.addEventListener('click', function () {
+          termsModal.style.display = 'none';
+        });
+      }
+    })();
+  </script>
+</body>
+</html>`;
+}
+
 async function handlePaymentLinkLanding(req, res, token) {
   const paymentLink = await getPaymentLink(token);
   if (!paymentLink) {
@@ -2077,19 +3636,26 @@ async function handlePaymentLinkLanding(req, res, token) {
     return html(res, 410, renderMessagePage('Payment link expired', 'This payment link has expired. Please request a new one.'));
   }
 
-  return html(
-    res,
-    200,
-    renderAutoPostPage('/api/initiate', {
-      merchantId: paymentLink.merchantId,
-      amount: paymentLink.amount,
-      currency: paymentLink.currency,
-      customerName: paymentLink.customerName,
-      email: paymentLink.email,
-      mobilePhone: paymentLink.mobilePhone,
-      paymentLinkToken: paymentLink.token || token,
-    })
-  );
+  const hiddenFields = {
+    merchantId: paymentLink.merchantId,
+    amount: paymentLink.amount,
+    currency: paymentLink.currency,
+    customerName: paymentLink.customerName,
+    email: paymentLink.email,
+    mobilePhone: paymentLink.mobilePhone,
+    paymentLinkToken: paymentLink.token || token,
+  };
+
+  if (paymentLink.invoiceNumber) {
+    const invoice = await getInvoice(paymentLink.invoiceNumber);
+    if (invoice) {
+      const portalDb = await loadMerchantPortalDb();
+      const merchantProfile = portalDb[invoice.username] || null;
+      return html(res, 200, renderInvoiceReviewPage(invoice, merchantProfile, hiddenFields));
+    }
+  }
+
+  return html(res, 200, renderAutoPostPage('/api/initiate', hiddenFields));
 }
 
 function handleHealth(req, res) {
@@ -2118,8 +3684,54 @@ module.exports = async function handler(req, res) {
       return res.end();
     }
 
-    if (req.method === 'GET' && (u.pathname === '/' || u.pathname === '/checkout')) {
-      return html(res, 200, renderPublicCheckoutPage(getRequestBaseUrl(req)));
+    if (req.method === 'GET' && u.pathname === '/login') {
+      const existingSession = getAuthenticatedSession(req);
+      if (existingSession) {
+        return redirect(res, '/portal');
+      }
+      return html(res, 200, renderLoginPage(getRequestBaseUrl(req)));
+    }
+
+    if (req.method === 'POST' && (u.pathname === '/api/login' || u.pathname === '/login')) {
+      return await handleLogin(req, res);
+    }
+
+    if (req.method === 'POST' && (u.pathname === '/api/logout' || u.pathname === '/logout')) {
+      return handleLogout(req, res);
+    }
+
+    if (req.method === 'GET' && (u.pathname === '/api/session' || u.pathname === '/session')) {
+      return handleSessionInfo(req, res);
+    }
+
+    if (req.method === 'POST' && u.pathname === '/api/account/password') {
+      return await handleChangePassword(req, res);
+    }
+
+    if (req.method === 'POST' && u.pathname === '/api/account/username') {
+      return await handleChangeUsername(req, res);
+    }
+
+    if (req.method === 'POST' && u.pathname === '/api/merchant/profile') {
+      return await handleUpdateMerchantProfile(req, res);
+    }
+
+    if (req.method === 'GET' && u.pathname === '/api/developer/merchants') {
+      return await handleListDeveloperMerchants(req, res);
+    }
+
+    if (req.method === 'POST' && u.pathname === '/api/developer/merchants') {
+      return await handleCreateDeveloperMerchant(req, res);
+    }
+
+    if (req.method === 'GET' && (u.pathname === '/' || u.pathname === '/portal')) {
+      const session = getAuthenticatedSession(req);
+      if (!session) {
+        return redirect(res, '/login');
+      }
+      const sessionView = buildSessionClientView(session);
+      const portalModel = await getPortalModelForSession(sessionView);
+      return html(res, 200, renderMerchantPortalPage(getRequestBaseUrl(req), sessionView, portalModel));
     }
 
     if (req.method === 'GET' && (u.pathname === '/api' || u.pathname === '/developer')) {
@@ -2132,6 +3744,20 @@ module.exports = async function handler(req, res) {
 
     if (req.method === 'POST' && (u.pathname === '/api/payment-links' || u.pathname === '/payment-links')) {
       return await handleCreatePaymentLink(req, res);
+    }
+
+    if (req.method === 'POST' && u.pathname === '/api/invoices') {
+      return await handleCreateInvoice(req, res);
+    }
+
+    if (req.method === 'GET' && u.pathname === '/api/invoices') {
+      return await handleListInvoices(req, res);
+    }
+
+    if (req.method === 'GET' && /^\/api\/invoices\/[^/]+\/pdf$/.test(u.pathname)) {
+      const parts = u.pathname.split('/').filter(Boolean);
+      const invoiceNumber = decodeURIComponent(parts[2] || '');
+      return await handleDownloadInvoicePdf(req, res, invoiceNumber);
     }
 
     if (req.method === 'GET' && (u.pathname === '/api/merchant-currency' || u.pathname === '/merchant-currency')) {

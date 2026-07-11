@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Merchant Portal Profile Database",
+  "description": "Per-merchant UI profile/settings for portal pages. Key should match username from merchant-users.json.",
+  "type": "object",
+  "additionalProperties": {
+    "type": "object",
+    "properties": {
+      "merchantName": { "type": "string" },
+      "logoUrl": { "type": "string" },
+      "address": { "type": "string" },
+      "email": { "type": "string" },
+      "phone": { "type": "string" },
+      "usdSettings": {
+        "type": "object",
+        "properties": {
+          "merchantId": { "type": "string" },
+          "secretKey": { "type": "string" },
+          "keyVersion": { "type": "string" }
+        },
+        "additionalProperties": false
+      },
+      "inrSettings": {
+        "type": "object",
+        "properties": {
+          "merchantId": { "type": "string" },
+          "secretKey": { "type": "string" },
+          "keyVersion": { "type": "string" }
+        },
+        "additionalProperties": false
+      },
+      "settings": {
+        "type": "object",
+        "properties": {
+          "useCustomerNames": { "type": "boolean" },
+          "sendInvoiceViaEmail": { "type": "boolean" },
+          "allowExternalPayments": { "type": "boolean" },
+          "paymentMessage": { "type": "string" },
+          "successfulPaymentMessage": { "type": "string" },
+          "termsAndConditions": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "required": ["merchantName", "usdSettings", "inrSettings", "settings"],
+    "additionalProperties": false
+  }
+}
