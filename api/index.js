@@ -116,6 +116,16 @@ async function saveTransactionHistory(record) {
   await db.collection('transactions').replaceOne({ _id: record._id }, record, { upsert: true });
 }
 
+async function listTransactionsForUsername(username) {
+  const db = await getMongoDb();
+  return db.collection('transactions').find({ username }).sort({ resolvedAt: -1 }).toArray();
+}
+
+async function deleteInvoiceById(invoiceNumber) {
+  const db = await getMongoDb();
+  await db.collection('invoices').deleteOne({ _id: invoiceNumber });
+}
+
 function getRequestBaseUrl(req) {
   if (process.env.CALLBACK_BASE_URL) return process.env.CALLBACK_BASE_URL;
   const fallbackProto = req.socket?.encrypted ? 'https' : 'http';
@@ -1001,6 +1011,13 @@ function generatePaymentLinkToken() {
   return crypto.randomBytes(18).toString('base64url');
 }
 
+async function expirePaymentLink(token) {
+  const link = await getPaymentLink(token);
+  if (!link) return;
+  link.expiresAt = new Date(0).toISOString();
+  await savePaymentLink(link);
+}
+
 async function doMkReq({ merchantId, purchaseId, merchantPublicKeyBase64Url, merchantPrivateKeyPem }) {
   const payload = {
     merchantId,
@@ -1161,11 +1178,15 @@ function renderMessagePage(title, message, details) {
 </html>`;
 }
 
-function renderResultPage(tx, paymentStatus, finalResult, homeUrl = '/', customSuccessMessage = '') {
+function renderResultPage(tx, paymentStatus, finalResult, homeUrl = '/', customSuccessMessage = '', merchantProfile = null) {
   const isSuccess = paymentStatus === 'SUCCESS';
   const isPaymentLinkFlow = tx?.initiationSource === 'payment-link' || !!tx?.paymentLinkToken;
   const responseCode = finalResult?.responseCode || '';
   const responseReason = getResponseReasonFromCode(responseCode, finalResult?.responseReason || '');
+  const merchantName = String(merchantProfile?.merchantName || '').trim() || 'Secure Payment Gateway';
+  const logoUrl = String(merchantProfile?.logoUrl || '').trim();
+  const merchantAddress = String(merchantProfile?.address || '').trim();
+  const addressLines = merchantAddress ? merchantAddress.split('\n').filter(Boolean) : [];
 
   const CURRENCY_NAMES = {
     '840': 'USD', '356': 'INR', '064': 'BTN', '524': 'NPR', '144': 'LKR',
@@ -1189,11 +1210,11 @@ function renderResultPage(tx, paymentStatus, finalResult, homeUrl = '/', customS
       : new Date().toLocaleString('en-GB');
   } catch { txDate = tx.createdAt || new Date().toString(); }
 
-  const accentColor  = isSuccess ? '#059669' : '#dc2626';
-  const statusColor  = isSuccess ? '#065f46' : '#7f1d1d';
+  const accentColor  = isSuccess ? '#16a34a' : '#dc2626';
+  const statusColor  = isSuccess ? '#2f7a3d' : '#7f1d1d';
   const statusBg     = isSuccess ? '#ecfdf5' : '#fef2f2';
   const statusBorder = isSuccess ? '#6ee7b7' : '#fca5a5';
-  const iconBg       = isSuccess ? '#10b981' : '#ef4444';
+  const iconBg       = isSuccess ? '#22c55e' : '#ef4444';
   const statusLabel  = isSuccess ? 'Payment Successful' : 'Payment Failed';
   const reasonText   = responseReason || (isSuccess ? 'Transaction approved' : 'Transaction declined');
 
@@ -1261,15 +1282,14 @@ function renderResultPage(tx, paymentStatus, finalResult, homeUrl = '/', customS
     *,*::before,*::after{box-sizing:border-box;}
     body{margin:0;padding:32px 16px;background:#f1f5f9;font-family:'Segoe UI',Arial,sans-serif;color:#1e293b;min-height:100vh;}
     .wrap{max-width:660px;margin:0 auto;}
-    /* ── Bank header ── */
-    .hdr{background:linear-gradient(135deg,#0f2d5e 0%,#1a4a8a 100%);border-radius:16px 16px 0 0;padding:20px 28px;
-      display:flex;align-items:center;gap:14px;}
-    .hdr-icon{width:48px;height:48px;border-radius:50%;background:rgba(255,255,255,.18);
-      display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0;}
-    .hdr-title{font-size:17px;font-weight:700;color:#fff;letter-spacing:.2px;}
-    .hdr-sub{font-size:11.5px;color:rgba(255,255,255,.6);margin-top:2px;}
     /* ── Card ── */
-    .card{background:#fff;border-radius:0 0 16px 16px;box-shadow:0 20px 60px rgba(15,45,94,.15);overflow:hidden;}
+    .card{background:#fff;border-radius:16px;box-shadow:0 20px 60px rgba(15,45,94,.12);overflow:hidden;}
+    /* ── Merchant letterhead ── */
+    .letterhead{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;padding:22px 28px;border-bottom:1px solid #e2e8f0;}
+    .brand-logo{max-height:56px;max-width:200px;object-fit:contain;}
+    .brand-name{font-size:24px;font-weight:700;color:#2f7a3d;font-family:Georgia,'Times New Roman',serif;}
+    .brand-address{text-align:right;font-size:12.5px;color:#334155;line-height:1.5;}
+    .brand-address .addr-name{font-weight:700;}
     /* ── Status banner ── */
     .sbanner{background:${statusBg};border-bottom:2px solid ${statusBorder};
       padding:24px 28px;display:flex;align-items:center;gap:18px;}
@@ -1293,8 +1313,8 @@ function renderResultPage(tx, paymentStatus, finalResult, homeUrl = '/', customS
     .btn-dl:hover{opacity:.88;}
     .btn-print{background:#f1f5f9;color:#334155;border:1px solid #cbd5e1;}
     .btn-print:hover{background:#e2e8f0;}
-    .btn-home{background:#0f2d5e;color:#fff;}
-    .btn-home:hover{background:#1a3f70;}
+    .btn-home{background:#2f7a3d;color:#fff;}
+    .btn-home:hover{background:#256030;}
     /* ── Footer ── */
     .ftr{padding:14px 28px 18px;background:#f8fafc;border-top:1px solid #e2e8f0;
       font-size:11px;color:#94a3b8;text-align:center;line-height:1.7;}
@@ -1302,28 +1322,29 @@ function renderResultPage(tx, paymentStatus, finalResult, homeUrl = '/', customS
     @media print{
       body{background:#fff;padding:0;}
       .wrap{max-width:100%;}
-      .hdr{background:#0f2d5e!important;-webkit-print-color-adjust:exact;print-color-adjust:exact;border-radius:0;}
       .card{box-shadow:none;border-radius:0;}
       .actions{display:none!important;}
       .ftr{font-size:9px;}
       @page{margin:12mm;}
     }
     @media(max-width:580px){
-      .hdr,.body,.actions,.ftr{padding-left:16px;padding-right:16px;}
+      .letterhead,.body,.actions,.ftr{padding-left:16px;padding-right:16px;}
       .sbanner{padding-left:16px;padding-right:16px;}
     }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <div class="hdr">
-      <div class="hdr-icon">&#127974;</div>
-      <div>
-        <div class="hdr-title">Secure Payment Gateway</div>
-        <div class="hdr-sub">Official Electronic Payment Receipt</div>
-      </div>
-    </div>
     <div class="card">
+      <div class="letterhead">
+        <div>
+          ${logoUrl ? `<img src="${escapeHtml(logoUrl)}" alt="${escapeHtml(merchantName)}" class="brand-logo" />` : `<div class="brand-name">${escapeHtml(merchantName)}</div>`}
+        </div>
+        <div class="brand-address">
+          <div class="addr-name">${escapeHtml(merchantName)}</div>
+          ${addressLines.map(line => `<div>${escapeHtml(line)}</div>`).join('')}
+        </div>
+      </div>
       <div class="sbanner">
         <div class="sicon">${isSuccess ? '&#10004;' : '&#10008;'}</div>
         <div>
@@ -1342,7 +1363,7 @@ function renderResultPage(tx, paymentStatus, finalResult, homeUrl = '/', customS
         ${homeButtonHtml}
       </div>
       <div class="ftr">
-        This is an official electronic receipt issued by the Secure Payment Gateway.<br>
+        This is an official electronic receipt issued on behalf of ${escapeHtml(merchantName)} via the Secure Payment Gateway.<br>
         Retain a copy for your records. For disputes or queries, share this receipt with the merchant or portal owner.
       </div>
     </div>
@@ -1435,7 +1456,27 @@ async function generateReceiptPdfBuffer(tx, paymentStatus, finalResult) {
   });
 }
 
-async function generateInvoicePdfBuffer(invoice) {
+async function resolveLogoBuffer(logoUrl) {
+  const url = String(logoUrl || '').trim();
+  if (!url) return null;
+
+  try {
+    if (url.startsWith('data:')) {
+      const match = /^data:image\/[a-zA-Z0-9.+-]+;base64,(.+)$/i.exec(url);
+      return match ? Buffer.from(match[1], 'base64') : null;
+    }
+    if (/^https?:\/\//i.test(url)) {
+      const res = await fetch(url);
+      if (!res.ok) return null;
+      return Buffer.from(await res.arrayBuffer());
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+async function generateInvoicePdfBuffer(invoice, merchantProfile = null) {
   const CURRENCY_NAMES = {
     '840': 'USD', '356': 'INR', '064': 'BTN', '524': 'NPR', '144': 'LKR',
     '586': 'PKR', '050': 'BDT', '702': 'SGD', '978': 'EUR', '826': 'GBP',
@@ -1462,6 +1503,8 @@ async function generateInvoicePdfBuffer(invoice) {
     ['Status', String(invoice.status || 'pending').toUpperCase()],
   ];
 
+  const logoBuffer = await resolveLogoBuffer(merchantProfile?.logoUrl);
+
   return await new Promise((resolve, reject) => {
     const doc = new PDFDocument({ size: 'A4', margin: 50 });
     const chunks = [];
@@ -1469,8 +1512,21 @@ async function generateInvoicePdfBuffer(invoice) {
     doc.on('end', () => resolve(Buffer.concat(chunks)));
     doc.on('error', reject);
 
-    doc.fillColor('#0f2d5e').font('Helvetica-Bold').fontSize(18).text(invoice.merchantName || 'Invoice');
-    doc.moveDown(0.2);
+    let logoRendered = false;
+    if (logoBuffer) {
+      try {
+        doc.image(logoBuffer, { fit: [140, 50] });
+        doc.moveDown(0.4);
+        logoRendered = true;
+      } catch {
+        logoRendered = false;
+      }
+    }
+
+    if (!logoRendered) {
+      doc.fillColor('#0f2d5e').font('Helvetica-Bold').fontSize(18).text(invoice.merchantName || 'Invoice');
+      doc.moveDown(0.2);
+    }
     doc.fillColor('#64748b').font('Helvetica').fontSize(10).text('Payment Invoice');
     doc.moveDown(1);
 
@@ -1715,6 +1771,14 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
     .status-pill.pending{background:#f59e0b}
     .status-pill.failed{background:#dc2626}
     .status-pill.expired{background:#64748b}
+    .row-icon-btn{border:0;background:transparent;cursor:pointer;font-size:15px;padding:2px 4px;line-height:1}
+    .row-icon-btn:hover{opacity:.7}
+    .detail-modal{position:fixed;inset:0;background:rgba(15,23,42,.5);display:flex;align-items:center;justify-content:center;padding:20px;z-index:50}
+    .detail-modal-inner{background:#fff;border-radius:12px;max-width:520px;width:100%;max-height:80vh;display:flex;flex-direction:column;padding:20px}
+    .detail-modal-head{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+    .detail-modal-head h3{margin:0;font-size:16px}
+    .detail-modal-body{overflow:auto;flex:1}
+    .detail-modal-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
     .form-actions{padding:12px 10px;display:flex;align-items:center;gap:10px}
     .credential-box{display:none;margin-top:10px;padding:10px;border:1px solid var(--line);border-radius:8px;background:#f8fafc}
     .credential-body{margin-top:6px;font-family:monospace;font-size:13px}
@@ -1904,8 +1968,8 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
           <h3>View My Payments</h3>
           <div class="card-body">
             <table style="width:100%;border-collapse:collapse;font-size:13px">
-              <thead><tr style="text-align:left;border-bottom:1px solid var(--line)"><th style="padding:6px">Invoice #</th><th style="padding:6px">Date Created</th><th style="padding:6px">Customer</th><th style="padding:6px">Currency</th><th style="padding:6px">Amount</th><th style="padding:6px">Payment Status</th><th style="padding:6px">Created By</th><th style="padding:6px">Actions</th></tr></thead>
-              <tbody id="paidInvoicesBody"><tr><td class="muted" style="padding:6px" colspan="8">Loading...</td></tr></tbody>
+              <thead><tr style="text-align:left;border-bottom:1px solid var(--line)"><th style="padding:6px">Transaction ID</th><th style="padding:6px">Customer</th><th style="padding:6px">Amount</th><th style="padding:6px">Status</th><th style="padding:6px">Date</th><th style="padding:6px">Actions</th></tr></thead>
+              <tbody id="paymentsTableBody"><tr><td class="muted" style="padding:6px" colspan="6">Loading...</td></tr></tbody>
             </table>
           </div>
         </div>
@@ -1981,6 +2045,20 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
       </section>
       ` : ''}
     </main>
+  </div>
+
+  <div id="detailModal" class="detail-modal" style="display:none">
+    <div class="detail-modal-inner">
+      <div class="detail-modal-head">
+        <img id="detailModalLogo" class="logo" alt="Merchant Logo" style="display:none" />
+        <h3 id="detailModalTitle"></h3>
+      </div>
+      <div id="detailModalBody" class="detail-modal-body"></div>
+      <div class="detail-modal-actions">
+        <a id="detailModalPdfLink" href="#" target="_blank" style="display:none"><button class="btn primary" type="button">Download PDF</button></a>
+        <button class="btn" type="button" id="detailModalCloseBtn">Close</button>
+      </div>
+    </div>
   </div>
 
   <script>
@@ -2262,8 +2340,102 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
           document.getElementById('emailInvoiceMsg').textContent = 'Email sending is not connected yet — coming in a later phase.';
         });
 
-        function renderInvoicesTable(tbodyId, invoices) {
-          const tbody = document.getElementById(tbodyId);
+        let invoicesCache = [];
+        let paymentsCache = [];
+
+        const detailModal = document.getElementById('detailModal');
+        const detailModalTitle = document.getElementById('detailModalTitle');
+        const detailModalBody = document.getElementById('detailModalBody');
+        const detailModalLogo = document.getElementById('detailModalLogo');
+        const detailModalPdfLink = document.getElementById('detailModalPdfLink');
+        const detailModalCloseBtn = document.getElementById('detailModalCloseBtn');
+
+        function escapeHtmlClient(value) {
+          return String(value == null ? '' : value).replace(/[&<>"']/g, function (c) {
+            return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+          });
+        }
+
+        function showDetailModal(title, rows, logoUrl, pdfUrl) {
+          detailModalTitle.textContent = title;
+          detailModalBody.innerHTML = rows.map(function (row) {
+            return '<div class="kv"><div class="k">' + row[0] + '</div><div>' + escapeHtmlClient(row[1] || '—') + '</div></div>';
+          }).join('');
+          if (logoUrl) {
+            detailModalLogo.src = logoUrl;
+            detailModalLogo.style.display = '';
+          } else {
+            detailModalLogo.style.display = 'none';
+          }
+          if (pdfUrl) {
+            detailModalPdfLink.href = pdfUrl;
+            detailModalPdfLink.style.display = '';
+          } else {
+            detailModalPdfLink.style.display = 'none';
+          }
+          detailModal.style.display = 'flex';
+        }
+
+        function hideDetailModal() {
+          detailModal.style.display = 'none';
+        }
+
+        detailModalCloseBtn.addEventListener('click', hideDetailModal);
+        detailModal.addEventListener('click', function (event) {
+          if (event.target === detailModal) hideDetailModal();
+        });
+
+        function viewInvoiceDetails(invoiceNumber) {
+          const inv = invoicesCache.find(function (i) { return i._id === invoiceNumber; });
+          if (!inv) return;
+          const currencyLabel = currencyNamesInv[inv.currency] || inv.currency;
+          const rows = [
+            ['Invoice Number', inv._id],
+            ['Customer Name', inv.customerName || ''],
+            ['Amount', currencyLabel + ' ' + Number(inv.amount).toFixed(2)],
+            ['Status', String(inv.status || 'pending').toUpperCase()],
+            ['Invoice Date', new Date(inv.invoiceDate).toLocaleString()],
+            ['Due Date', new Date(inv.dueDate).toLocaleString()],
+            ['Customer Message', inv.customerMessage || ''],
+            ['Terms &amp; Conditions', inv.termsAndConditions || ''],
+          ];
+          showDetailModal('Invoice ' + inv._id, rows, portal.logoUrl, '/api/invoices/' + encodeURIComponent(inv._id) + '/pdf');
+        }
+
+        function viewPaymentDetails(txnId) {
+          const tx = paymentsCache.find(function (t) { return t._id === txnId; });
+          if (!tx) return;
+          const currencyLabel = currencyNamesInv[tx.currency] || tx.currency;
+          const rows = [
+            ['Transaction ID', tx._id],
+            ['Order Reference', tx.orderRef || ''],
+            ['Amount', currencyLabel + ' ' + Number(tx.amountMajor || 0).toFixed(2)],
+            ['Authorization Code', tx.authorizationCode || ''],
+            ['Reference Number (RRN)', tx.referenceNumber || ''],
+            ['Response Code', tx.responseCode || ''],
+            ['Response Description', tx.responseReason || ''],
+            ['Merchant ID', tx.merchantId || ''],
+            ['Customer Name', tx.customerName || ''],
+            ['Transaction Date &amp; Time', new Date(tx.resolvedAt).toLocaleString()],
+            ['Payment Status', String(tx.status || '').toUpperCase()],
+          ];
+          showDetailModal('Transaction ' + tx._id, rows, portal.logoUrl, null);
+        }
+
+        async function deleteInvoice(invoiceNumber) {
+          if (!window.confirm('Delete invoice ' + invoiceNumber + '? This cannot be undone.')) return;
+          try {
+            const res = await fetch('/api/invoices/' + encodeURIComponent(invoiceNumber), { method: 'DELETE' });
+            const data = await res.json().catch(function () { return {}; });
+            if (!res.ok) throw new Error(data.error || 'Unable to delete invoice.');
+            loadInvoices();
+          } catch (error) {
+            window.alert(error.message || 'Error deleting invoice.');
+          }
+        }
+
+        function renderInvoicesTable(invoices) {
+          const tbody = document.getElementById('allInvoicesBody');
           if (!invoices.length) {
             tbody.innerHTML = '<tr><td class="muted" style="padding:6px" colspan="8">No invoices yet.</td></tr>';
             return;
@@ -2272,9 +2444,11 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
             const currencyLabel = currencyNamesInv[inv.currency] || inv.currency;
             const amount = Number(inv.amount).toFixed(2);
             const created = new Date(inv.createdAt).toLocaleDateString();
-            const pdfUrl = '/api/invoices/' + encodeURIComponent(inv._id) + '/pdf';
             const status = String(inv.status || 'pending').toLowerCase();
             const statusLabel = status.charAt(0).toUpperCase() + status.slice(1);
+            const deleteBtn = status === 'pending'
+              ? '<button class="row-icon-btn" data-delete-invoice="' + inv._id + '" title="Delete invoice">🗑️</button>'
+              : '';
             return '<tr style="border-top:1px solid #e2e8f0">' +
               '<td style="padding:6px">' + inv._id + '</td>' +
               '<td style="padding:6px">' + created + '</td>' +
@@ -2283,26 +2457,74 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
               '<td style="padding:6px">' + amount + '</td>' +
               '<td style="padding:6px"><span class="status-pill ' + status + '">' + statusLabel + '</span></td>' +
               '<td style="padding:6px">' + (inv.username || '—') + '</td>' +
-              '<td style="padding:6px"><a href="' + pdfUrl + '" target="_blank">PDF</a></td>' +
+              '<td style="padding:6px"><button class="row-icon-btn" data-view-invoice="' + inv._id + '" title="View details">👁️</button>' + deleteBtn + '</td>' +
               '</tr>';
           }).join('');
         }
 
-        async function loadInvoices(tbodyId, statusFilter) {
+        function renderPaymentsTable(transactions) {
+          const tbody = document.getElementById('paymentsTableBody');
+          if (!transactions.length) {
+            tbody.innerHTML = '<tr><td class="muted" style="padding:6px" colspan="6">No payments yet.</td></tr>';
+            return;
+          }
+          tbody.innerHTML = transactions.map(function (tx) {
+            const currencyLabel = currencyNamesInv[tx.currency] || tx.currency;
+            const amount = Number(tx.amountMajor || 0).toFixed(2);
+            const when = new Date(tx.resolvedAt).toLocaleDateString();
+            const status = String(tx.status || '').toLowerCase();
+            const statusLabel = status.charAt(0).toUpperCase() + status.slice(1);
+            return '<tr style="border-top:1px solid #e2e8f0">' +
+              '<td style="padding:6px">' + tx._id + '</td>' +
+              '<td style="padding:6px">' + (tx.customerName || '—') + '</td>' +
+              '<td style="padding:6px">' + currencyLabel + ' ' + amount + '</td>' +
+              '<td style="padding:6px"><span class="status-pill ' + status + '">' + statusLabel + '</span></td>' +
+              '<td style="padding:6px">' + when + '</td>' +
+              '<td style="padding:6px"><button class="row-icon-btn" data-view-txn="' + tx._id + '" title="View details">👁️</button></td>' +
+              '</tr>';
+          }).join('');
+        }
+
+        async function loadInvoices() {
+          const tbody = document.getElementById('allInvoicesBody');
           try {
-            const url = statusFilter ? '/api/invoices?status=' + encodeURIComponent(statusFilter) : '/api/invoices';
-            const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
+            const res = await fetch('/api/invoices', { headers: { 'Accept': 'application/json' } });
             const data = await res.json().catch(function () { return {}; });
-            renderInvoicesTable(tbodyId, data.invoices || []);
+            invoicesCache = data.invoices || [];
+            renderInvoicesTable(invoicesCache);
           } catch (error) {
-            document.getElementById(tbodyId).innerHTML = '<tr><td class="muted" style="padding:6px" colspan="8">Unable to load invoices.</td></tr>';
+            tbody.innerHTML = '<tr><td class="muted" style="padding:6px" colspan="8">Unable to load invoices.</td></tr>';
           }
         }
 
+        async function loadPayments() {
+          const tbody = document.getElementById('paymentsTableBody');
+          try {
+            const res = await fetch('/api/transactions', { headers: { 'Accept': 'application/json' } });
+            const data = await res.json().catch(function () { return {}; });
+            paymentsCache = data.transactions || [];
+            renderPaymentsTable(paymentsCache);
+          } catch (error) {
+            tbody.innerHTML = '<tr><td class="muted" style="padding:6px" colspan="6">Unable to load payments.</td></tr>';
+          }
+        }
+
+        document.getElementById('allInvoicesBody').addEventListener('click', function (event) {
+          const viewBtn = event.target.closest('[data-view-invoice]');
+          if (viewBtn) return viewInvoiceDetails(viewBtn.getAttribute('data-view-invoice'));
+          const deleteBtn = event.target.closest('[data-delete-invoice]');
+          if (deleteBtn) return deleteInvoice(deleteBtn.getAttribute('data-delete-invoice'));
+        });
+
+        document.getElementById('paymentsTableBody').addEventListener('click', function (event) {
+          const viewBtn = event.target.closest('[data-view-txn]');
+          if (viewBtn) return viewPaymentDetails(viewBtn.getAttribute('data-view-txn'));
+        });
+
         const allInvoicesBtn = document.querySelector('[data-target="invoices-all"]');
         const paidInvoicesBtn = document.querySelector('[data-target="invoices-payments"]');
-        if (allInvoicesBtn) allInvoicesBtn.addEventListener('click', function () { loadInvoices('allInvoicesBody'); });
-        if (paidInvoicesBtn) paidInvoicesBtn.addEventListener('click', function () { loadInvoices('paidInvoicesBody', 'paid'); });
+        if (allInvoicesBtn) allInvoicesBtn.addEventListener('click', loadInvoices);
+        if (paidInvoicesBtn) paidInvoicesBtn.addEventListener('click', loadPayments);
       })();
 
       if (session.role === 'developer') {
@@ -2973,7 +3195,7 @@ async function handleInitiate(req, res) {
 
 async function finalizeTransactionOutcome(tx, effectiveStatus, finalResult) {
   if (effectiveStatus !== 'SUCCESS' && effectiveStatus !== 'FAILED') {
-    return { customSuccessMessage: '' };
+    return { customSuccessMessage: '', merchantProfile: null };
   }
 
   let invoice = null;
@@ -3025,7 +3247,18 @@ async function finalizeTransactionOutcome(tx, effectiveStatus, finalResult) {
     console.error('[Cardzone][finalize] saving transaction history failed for txn', tx.txnId, error.message);
   }
 
-  return { customSuccessMessage };
+  let merchantProfile = null;
+  const ownerUsername = invoice?.username || tx.username || null;
+  if (ownerUsername) {
+    try {
+      const portalDb = await loadMerchantPortalDb();
+      merchantProfile = portalDb[ownerUsername] || null;
+    } catch (error) {
+      console.error('[Cardzone][finalize] loading merchant profile failed for txn', tx.txnId, error.message);
+    }
+  }
+
+  return { customSuccessMessage, merchantProfile };
 }
 
 async function handleCallback(req, res) {
@@ -3140,8 +3373,8 @@ async function handleCallback(req, res) {
     );
   }
 
-  const { customSuccessMessage } = await finalizeTransactionOutcome(tx, finalStatus, finalResult);
-  return html(res, 200, renderResultPage(tx, finalStatus, finalResult, getRequestBaseUrl(req), customSuccessMessage));
+  const { customSuccessMessage, merchantProfile } = await finalizeTransactionOutcome(tx, finalStatus, finalResult);
+  return html(res, 200, renderResultPage(tx, finalStatus, finalResult, getRequestBaseUrl(req), customSuccessMessage, merchantProfile));
 }
 
 async function handleReturn(req, res) {
@@ -3246,7 +3479,7 @@ async function handleReturn(req, res) {
     );
   }
 
-  const { customSuccessMessage } = await finalizeTransactionOutcome(tx, effectiveStatus, finalResult);
+  const { customSuccessMessage, merchantProfile } = await finalizeTransactionOutcome(tx, effectiveStatus, finalResult);
 
   if (effectiveStatus === 'SUCCESS' && tx.successReturnUrl) {
     const redirectUrl = appendResultParams(tx.successReturnUrl, { txnId: tx.txnId, status: effectiveStatus });
@@ -3257,7 +3490,7 @@ async function handleReturn(req, res) {
     if (redirectUrl) return redirect(res, redirectUrl);
   }
 
-  return html(res, 200, renderResultPage(tx, effectiveStatus, finalResult, getRequestBaseUrl(req), customSuccessMessage));
+  return html(res, 200, renderResultPage(tx, effectiveStatus, finalResult, getRequestBaseUrl(req), customSuccessMessage, merchantProfile));
 }
 
 async function handleTxDebug(req, res, txnId) {
@@ -3464,6 +3697,34 @@ async function handleListInvoices(req, res) {
   return json(res, 200, { invoices });
 }
 
+async function handleDeleteInvoice(req, res, invoiceNumber) {
+  const session = getAuthenticatedSession(req);
+  if (!session) return json(res, 401, { error: 'Login required' });
+
+  const invoice = await getInvoice(invoiceNumber);
+  if (!invoice || invoice.username !== session.username) {
+    return json(res, 404, { error: 'Invoice not found' });
+  }
+  if (invoice.status !== 'pending') {
+    return json(res, 400, { error: 'Only unpaid invoices can be deleted' });
+  }
+
+  if (invoice.paymentLinkToken) {
+    await expirePaymentLink(invoice.paymentLinkToken);
+  }
+  await deleteInvoiceById(invoiceNumber);
+
+  return json(res, 200, { ok: true });
+}
+
+async function handleListTransactions(req, res) {
+  const session = getAuthenticatedSession(req);
+  if (!session) return json(res, 401, { error: 'Login required' });
+
+  const transactions = await listTransactionsForUsername(session.username);
+  return json(res, 200, { transactions });
+}
+
 async function handleDownloadInvoicePdf(req, res, invoiceNumber) {
   const session = getAuthenticatedSession(req);
   if (!session) return json(res, 401, { error: 'Login required' });
@@ -3473,7 +3734,9 @@ async function handleDownloadInvoicePdf(req, res, invoiceNumber) {
     return json(res, 404, { error: 'Invoice not found' });
   }
 
-  const pdfBuffer = await generateInvoicePdfBuffer(invoice);
+  const portalDb = await loadMerchantPortalDb();
+  const merchantProfile = portalDb[invoice.username] || null;
+  const pdfBuffer = await generateInvoicePdfBuffer(invoice, merchantProfile);
   res.statusCode = 200;
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader('Content-Disposition', `attachment; filename="${invoice._id}.pdf"`);
@@ -3758,6 +4021,16 @@ module.exports = async function handler(req, res) {
       const parts = u.pathname.split('/').filter(Boolean);
       const invoiceNumber = decodeURIComponent(parts[2] || '');
       return await handleDownloadInvoicePdf(req, res, invoiceNumber);
+    }
+
+    if (req.method === 'DELETE' && /^\/api\/invoices\/[^/]+$/.test(u.pathname)) {
+      const parts = u.pathname.split('/').filter(Boolean);
+      const invoiceNumber = decodeURIComponent(parts[2] || '');
+      return await handleDeleteInvoice(req, res, invoiceNumber);
+    }
+
+    if (req.method === 'GET' && u.pathname === '/api/transactions') {
+      return await handleListTransactions(req, res);
     }
 
     if (req.method === 'GET' && (u.pathname === '/api/merchant-currency' || u.pathname === '/merchant-currency')) {
