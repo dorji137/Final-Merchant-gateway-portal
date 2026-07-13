@@ -20,6 +20,7 @@ const PAYMENT_LINK_TTL_MS = Number(process.env.PAYMENT_LINK_TTL_MS || 30 * 60 * 
 const INVOICE_DEFAULT_DUE_MS = Number(process.env.INVOICE_DEFAULT_DUE_MS || 7 * 24 * 60 * 60 * 1000);
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 12 * 60 * 60 * 1000);
+const SESSION_INACTIVITY_MS = Number(process.env.SESSION_INACTIVITY_MS || 5 * 60 * 1000);
 
 const txStore = new Map();
 
@@ -417,6 +418,21 @@ async function getAuthenticatedSession(req) {
     await deleteSessionRecord(token);
     return null;
   }
+  const lastActivity = Date.parse(session.lastActivityAt || session.createdAt || '');
+  if (Number.isNaN(lastActivity) || Date.now() - lastActivity > SESSION_INACTIVITY_MS) {
+    await deleteSessionRecord(token);
+    return null;
+  }
+  return session;
+}
+
+async function touchSessionActivity(req) {
+  const token = getSessionTokenFromRequest(req);
+  if (!token) return null;
+  const session = await getAuthenticatedSession(req);
+  if (!session) return null;
+  session.lastActivityAt = new Date().toISOString();
+  await saveSessionRecord(token, session);
   return session;
 }
 
@@ -1042,10 +1058,24 @@ function mapTransactionLifecycleStatus({ callbackReceived, finalResult }) {
 }
 
 let pendingTxIndexEnsured = false;
-function ensurePendingTxIndex(db) {
+const PENDING_TX_TTL_SECONDS = 400 * 24 * 60 * 60;
+async function ensurePendingTxIndex(db) {
   if (pendingTxIndexEnsured) return;
   pendingTxIndexEnsured = true;
-  db.collection('pendingTransactions').createIndex({ createdAtDate: 1 }, { expireAfterSeconds: 30 * 24 * 60 * 60 }).catch(() => {});
+  try {
+    await db.collection('pendingTransactions').createIndex({ createdAtDate: 1 }, { expireAfterSeconds: PENDING_TX_TTL_SECONDS });
+  } catch (err) {
+    if (err?.code === 85 || err?.codeName === 'IndexOptionsConflict') {
+      try {
+        await db.command({
+          collMod: 'pendingTransactions',
+          index: { keyPattern: { createdAtDate: 1 }, expireAfterSeconds: PENDING_TX_TTL_SECONDS },
+        });
+      } catch {
+        // best-effort background maintenance; not critical to request success
+      }
+    }
+  }
 }
 
 async function saveTransaction(tx) {
@@ -1148,6 +1178,18 @@ async function doMkReq({ merchantId, purchaseId, merchantPublicKeyBase64Url, mer
   return { requestPayload: payload, responsePayload: data };
 }
 
+function parseHtmlHiddenFormFields(html) {
+  const result = {};
+  const inputTags = html.match(/<input\b[^>]*>/gi) || [];
+  for (const tag of inputTags) {
+    const nameMatch = /\bname\s*=\s*"([^"]*)"/i.exec(tag) || /\bname\s*=\s*'([^']*)'/i.exec(tag);
+    if (!nameMatch) continue;
+    const valueMatch = /\bvalue\s*=\s*"([^"]*)"/i.exec(tag) || /\bvalue\s*=\s*'([^']*)'/i.exec(tag);
+    result[nameMatch[1]] = valueMatch ? valueMatch[1] : '';
+  }
+  return result;
+}
+
 function parseCardzoneResponseBody(rawText, contentType = '') {
   const text = String(rawText || '');
   const type = String(contentType || '').toLowerCase();
@@ -1160,6 +1202,11 @@ function parseCardzoneResponseBody(rawText, contentType = '') {
     } catch {
       return {};
     }
+  }
+
+  const trimmed = text.trim().toLowerCase();
+  if (type.includes('text/html') || trimmed.startsWith('<!doctype') || trimmed.startsWith('<html')) {
+    return parseHtmlHiddenFormFields(text);
   }
 
   if (type.includes('application/x-www-form-urlencoded') || type.includes('text/plain') || text.includes('=')) {
@@ -2535,17 +2582,51 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
 
       document.getElementById('logoutBtn').addEventListener('click', performLogout);
 
-      const INACTIVITY_LIMIT_MS = 5 * 60 * 1000;
-      let lastActivityAt = Date.now();
-      function markActivity() { lastActivityAt = Date.now(); }
+      // Inactivity timeout is enforced server-side (session.lastActivityAt), so it
+      // still works correctly even when mobile browsers suspend JS timers in the
+      // background. The client's job is just to (a) tell the server about real
+      // user activity, throttled, and (b) notice promptly when the server has
+      // already expired the session, especially right after the tab regains focus.
+      var activitySinceLastPing = true;
+      function markActivity() { activitySinceLastPing = true; }
       ['mousemove', 'mousedown', 'keydown', 'scroll', 'touchstart', 'click'].forEach(function (evt) {
         document.addEventListener(evt, markActivity, { passive: true });
       });
-      setInterval(function () {
-        if (Date.now() - lastActivityAt > INACTIVITY_LIMIT_MS) {
-          performLogout();
+
+      async function checkSessionStillValid() {
+        try {
+          const res = await fetch('/api/session', { headers: { 'Accept': 'application/json' } });
+          if (res.status === 401) {
+            window.location.href = '/login';
+            return false;
+          }
+        } catch (error) {
+          // network hiccup; don't force a logout on connectivity issues
         }
-      }, 15000);
+        return true;
+      }
+
+      async function pingActivityIfNeeded() {
+        if (!activitySinceLastPing) {
+          await checkSessionStillValid();
+          return;
+        }
+        activitySinceLastPing = false;
+        try {
+          const res = await fetch('/api/activity-ping', { method: 'POST', headers: { 'Accept': 'application/json' } });
+          if (res.status === 401) {
+            window.location.href = '/login';
+          }
+        } catch (error) {
+          // network hiccup; try again on the next tick
+        }
+      }
+
+      setInterval(pingActivityIfNeeded, 60000);
+
+      document.addEventListener('visibilitychange', function () {
+        if (document.visibilityState === 'visible') checkSessionStillValid();
+      });
 
       document.getElementById('editMerchantName').value = portal.merchantName || '';
       document.getElementById('editAddress').value = portal.address || '';
@@ -3137,25 +3218,30 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
           }
         }
 
-        const NOTIF_SEEN_KEY = 'portalNotificationsSeenKeys';
-        const NOTIF_DISMISSED_KEY = 'portalNotificationsDismissedKeys';
         function notificationKey(item) { return item.type + ':' + item.invoiceNumber; }
-        function getSeenNotificationKeys() {
-          try { return JSON.parse(window.localStorage.getItem(NOTIF_SEEN_KEY) || '[]'); } catch (e) { return []; }
+
+        async function markNotificationsSeen(keys) {
+          if (!keys.length) return;
+          try {
+            await fetch('/api/notifications/seen', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+              body: JSON.stringify({ keys: keys }),
+            });
+          } catch (error) { /* non-critical; badge will just reappear next load */ }
         }
-        function saveSeenNotificationKeys(keys) {
-          try { window.localStorage.setItem(NOTIF_SEEN_KEY, JSON.stringify(keys)); } catch (e) { /* ignore storage errors */ }
-        }
-        function getDismissedNotificationKeys() {
-          try { return JSON.parse(window.localStorage.getItem(NOTIF_DISMISSED_KEY) || '[]'); } catch (e) { return []; }
-        }
-        function saveDismissedNotificationKeys(keys) {
-          try { window.localStorage.setItem(NOTIF_DISMISSED_KEY, JSON.stringify(keys)); } catch (e) { /* ignore storage errors */ }
-        }
-        function dismissNotifications(keysToDismiss) {
-          const dismissed = getDismissedNotificationKeys();
-          keysToDismiss.forEach(function (k) { if (dismissed.indexOf(k) === -1) dismissed.push(k); });
-          saveDismissedNotificationKeys(dismissed);
+
+        async function dismissNotifications(keys) {
+          if (!keys.length) return;
+          try {
+            await fetch('/api/notifications/dismiss', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+              body: JSON.stringify({ keys: keys }),
+            });
+          } catch (error) {
+            window.alert('Unable to clear notification. Please try again.');
+          }
         }
 
         async function loadNotifications(markSeen) {
@@ -3165,27 +3251,17 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
             const res = await fetch('/api/notifications', { headers: { 'Accept': 'application/json' } });
             const data = await res.json().catch(function () { return {}; });
             if (!res.ok) throw new Error(data.error || 'Unable to load notifications.');
-            const allItems = data.items || [];
-            const allKeys = allItems.map(notificationKey);
-
-            const dismissedBefore = getDismissedNotificationKeys().filter(function (k) { return allKeys.indexOf(k) !== -1; });
-            saveDismissedNotificationKeys(dismissedBefore);
-            const items = allItems.filter(function (item) { return dismissedBefore.indexOf(notificationKey(item)) === -1; });
-
-            const currentKeys = items.map(notificationKey);
-            const seenBefore = getSeenNotificationKeys().filter(function (k) { return currentKeys.indexOf(k) !== -1; });
+            const items = data.items || [];
 
             if (!items.length) {
               body.innerHTML = '<div class="bell-empty">No notifications right now.</div>';
               updateBellBadge(0);
-              saveSeenNotificationKeys(seenBefore);
               return;
             }
 
             body.innerHTML = items.map(function (item) {
               const key = notificationKey(item);
-              const isUnread = seenBefore.indexOf(key) === -1;
-              return '<div class="bell-item' + (isUnread ? ' unread' : '') + '">' +
+              return '<div class="bell-item' + (item.unread ? ' unread' : '') + '">' +
                 '<span class="dot ' + item.type + '"></span>' +
                 '<div class="bell-item-text">' + item.message + '</div>' +
                 '<button class="bell-item-clear" data-clear-notif="' + key + '" title="Clear">✕</button>' +
@@ -3194,11 +3270,9 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
 
             if (markSeen) {
               updateBellBadge(0);
-              saveSeenNotificationKeys(currentKeys);
+              markNotificationsSeen(items.map(notificationKey));
             } else {
-              const unreadCount = items.filter(function (item) { return seenBefore.indexOf(notificationKey(item)) === -1; }).length;
-              updateBellBadge(unreadCount);
-              saveSeenNotificationKeys(seenBefore);
+              updateBellBadge(data.count || 0);
             }
           } catch (error) {
             body.innerHTML = '<div class="bell-empty">Unable to load notifications.</div>';
@@ -3208,16 +3282,14 @@ function renderMerchantPortalPage(baseUrl, sessionView, portalModel) {
         document.getElementById('bellPanelBody').addEventListener('click', function (event) {
           const clearBtn = event.target.closest('[data-clear-notif]');
           if (!clearBtn) return;
-          dismissNotifications([clearBtn.getAttribute('data-clear-notif')]);
-          loadNotifications(true);
+          dismissNotifications([clearBtn.getAttribute('data-clear-notif')]).then(function () { loadNotifications(true); });
         });
 
         document.getElementById('clearAllNotifsBtn').addEventListener('click', function () {
           const keys = Array.from(document.querySelectorAll('#bellPanelBody [data-clear-notif]')).map(function (el) {
             return el.getAttribute('data-clear-notif');
           });
-          dismissNotifications(keys);
-          loadNotifications(true);
+          dismissNotifications(keys).then(function () { loadNotifications(true); });
         });
 
         function escapeHtmlLocal(value) {
@@ -3524,6 +3596,7 @@ async function handleLogin(req, res) {
     defaultCurrency: user.defaultCurrency,
     createdAt: createdAt.toISOString(),
     expiresAt: expiresAt.toISOString(),
+    lastActivityAt: createdAt.toISOString(),
   };
   await saveSessionRecord(token, sessionData);
 
@@ -3553,6 +3626,14 @@ async function handleSessionInfo(req, res) {
     user: buildSessionClientView(session),
     expiresAt: session.expiresAt,
   });
+}
+
+async function handleActivityPing(req, res) {
+  const session = await touchSessionActivity(req);
+  if (!session) {
+    return json(res, 401, { authenticated: false });
+  }
+  return json(res, 200, { authenticated: true });
 }
 
 async function handleChangePassword(req, res) {
@@ -4810,6 +4891,10 @@ async function handleDashboardSummary(req, res) {
   });
 }
 
+function notificationKey(item) {
+  return item.type + ':' + item.invoiceNumber;
+}
+
 async function handleListNotifications(req, res) {
   const session = await getAuthenticatedSession(req);
   if (!session) return json(res, 401, { error: 'Login required' });
@@ -4819,16 +4904,16 @@ async function handleListNotifications(req, res) {
   const now = Date.now();
   const soonMs = 2 * 24 * 60 * 60 * 1000;
   const recentFailMs = 7 * 24 * 60 * 60 * 1000;
-  const items = [];
+  const rawItems = [];
 
   const pendingInvoices = await db.collection('invoices').find({ username, status: 'pending' }).toArray();
   for (const inv of pendingInvoices) {
     const dueAt = Date.parse(inv.dueDate);
     if (Number.isNaN(dueAt)) continue;
     if (dueAt < now) {
-      items.push({ type: 'overdue', invoiceNumber: inv._id, message: `Invoice ${inv._id} is overdue`, at: inv.dueDate });
+      rawItems.push({ type: 'overdue', invoiceNumber: inv._id, message: `Invoice ${inv._id} is overdue`, at: inv.dueDate });
     } else if (dueAt - now <= soonMs) {
-      items.push({ type: 'due-soon', invoiceNumber: inv._id, message: `Invoice ${inv._id} is due soon`, at: inv.dueDate });
+      rawItems.push({ type: 'due-soon', invoiceNumber: inv._id, message: `Invoice ${inv._id} is due soon`, at: inv.dueDate });
     }
   }
 
@@ -4836,13 +4921,75 @@ async function handleListNotifications(req, res) {
   for (const inv of recentFailed) {
     const updatedAt = Date.parse(inv.updatedAt);
     if (!Number.isNaN(updatedAt) && now - updatedAt <= recentFailMs) {
-      items.push({ type: 'failed', invoiceNumber: inv._id, message: `Payment for invoice ${inv._id} failed`, at: inv.updatedAt });
+      rawItems.push({ type: 'failed', invoiceNumber: inv._id, message: `Payment for invoice ${inv._id} failed`, at: inv.updatedAt });
     }
   }
 
-  items.sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+  rawItems.sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
 
-  return json(res, 200, { count: items.length, items });
+  const stateDoc = await db.collection('notificationState').findOne({ _id: username });
+  const currentKeys = rawItems.map(notificationKey);
+  const dismissedKeys = (stateDoc?.dismissedKeys || []).filter(k => currentKeys.includes(k));
+  const seenKeys = (stateDoc?.seenKeys || []).filter(k => currentKeys.includes(k));
+  if (stateDoc && (dismissedKeys.length !== (stateDoc.dismissedKeys || []).length || seenKeys.length !== (stateDoc.seenKeys || []).length)) {
+    await db.collection('notificationState').updateOne(
+      { _id: username },
+      { $set: { dismissedKeys, seenKeys } }
+    );
+  }
+
+  const dismissedSet = new Set(dismissedKeys);
+  const seenSet = new Set(seenKeys);
+  const items = rawItems
+    .filter(item => !dismissedSet.has(notificationKey(item)))
+    .map(item => ({ ...item, unread: !seenSet.has(notificationKey(item)) }));
+  const unreadCount = items.filter(item => item.unread).length;
+
+  return json(res, 200, { count: unreadCount, items });
+}
+
+async function handleMarkNotificationsSeen(req, res) {
+  const session = await getAuthenticatedSession(req);
+  if (!session) return json(res, 401, { error: 'Login required' });
+
+  const raw = await parseBody(req);
+  const contentType = (req.headers['content-type'] || '').toLowerCase();
+  const input = parseRawPayload(raw, contentType);
+  const keys = Array.isArray(input.keys) ? input.keys.map(String) : [];
+
+  const db = await getMongoDb();
+  const stateDoc = await db.collection('notificationState').findOne({ _id: session.username });
+  const seenKeys = new Set(stateDoc?.seenKeys || []);
+  keys.forEach(k => seenKeys.add(k));
+  await db.collection('notificationState').updateOne(
+    { _id: session.username },
+    { $set: { seenKeys: Array.from(seenKeys) } },
+    { upsert: true }
+  );
+
+  return json(res, 200, { ok: true });
+}
+
+async function handleDismissNotifications(req, res) {
+  const session = await getAuthenticatedSession(req);
+  if (!session) return json(res, 401, { error: 'Login required' });
+
+  const raw = await parseBody(req);
+  const contentType = (req.headers['content-type'] || '').toLowerCase();
+  const input = parseRawPayload(raw, contentType);
+  const keys = Array.isArray(input.keys) ? input.keys.map(String) : [];
+
+  const db = await getMongoDb();
+  const stateDoc = await db.collection('notificationState').findOne({ _id: session.username });
+  const dismissedKeys = new Set(stateDoc?.dismissedKeys || []);
+  keys.forEach(k => dismissedKeys.add(k));
+  await db.collection('notificationState').updateOne(
+    { _id: session.username },
+    { $set: { dismissedKeys: Array.from(dismissedKeys) } },
+    { upsert: true }
+  );
+
+  return json(res, 200, { ok: true });
 }
 
 async function handleDownloadInvoicePdf(req, res, invoiceNumber) {
@@ -5087,6 +5234,10 @@ module.exports = async function handler(req, res) {
       return await handleSessionInfo(req, res);
     }
 
+    if (req.method === 'POST' && u.pathname === '/api/activity-ping') {
+      return await handleActivityPing(req, res);
+    }
+
     if (req.method === 'POST' && u.pathname === '/api/account/password') {
       return await handleChangePassword(req, res);
     }
@@ -5165,6 +5316,14 @@ module.exports = async function handler(req, res) {
 
     if (req.method === 'GET' && u.pathname === '/api/notifications') {
       return await handleListNotifications(req, res);
+    }
+
+    if (req.method === 'POST' && u.pathname === '/api/notifications/seen') {
+      return await handleMarkNotificationsSeen(req, res);
+    }
+
+    if (req.method === 'POST' && u.pathname === '/api/notifications/dismiss') {
+      return await handleDismissNotifications(req, res);
     }
 
     if (req.method === 'POST' && /^\/api\/invoices\/[^/]+\/send-email$/.test(u.pathname)) {
