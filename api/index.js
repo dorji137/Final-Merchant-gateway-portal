@@ -1911,7 +1911,6 @@ function renderLoginPage(baseUrl, errorMessage = '') {
   <section class="card">
     <div class="head">
       <h1>Merchant Login</h1>
-      <p>Sign in to open your mapped payment portal.</p>
     </div>
     <div class="body">
       ${safeError ? `<p class="error">${safeError}</p>` : ''}
@@ -1922,7 +1921,6 @@ function renderLoginPage(baseUrl, errorMessage = '') {
         <input id="password" name="password" type="password" required placeholder="Enter password" />
         <button id="loginBtn" type="submit">Login</button>
       </form>
-      <div class="tiny">Gateway: ${escapeHtml(baseUrl)}</div>
     </div>
   </section>
   <script>
